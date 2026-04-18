@@ -10,7 +10,7 @@ GEN_OPTS__FLAG :=
 GEN_CMDS__FLAG := 
 
 ORDERED_OBJS += \
-"./main.obj" \
+"./carrier_verify.obj" \
 "../lnk_msp430g2553.cmd" \
 $(GEN_CMDS__FLAG) \
 -llibc.a \
@@ -146,8 +146,8 @@ Blink\ LED.txt: $(EXE_OUTPUTS)
 # Other Targets
 clean:
 	-$(RM) $(BIN_OUTPUTS__QUOTED)$(EXE_OUTPUTS__QUOTED)
-	-$(RM) "main.obj" 
-	-$(RM) "main.d" 
+	-$(RM) "carrier_verify.obj" 
+	-$(RM) "carrier_verify.d" 
 	-@echo ' '
 
 secondary-outputs: $(BIN_OUTPUTS)

@@ -9,21 +9,21 @@ CMD_SRCS += \
 ../lnk_msp430g2553.cmd 
 
 C_SRCS += \
-../main.c 
+../carrier_verify.c 
 
 C_DEPS += \
-./main.d 
+./carrier_verify.d 
 
 OBJS += \
-./main.obj 
+./carrier_verify.obj 
 
 OBJS__QUOTED += \
-"main.obj" 
+"carrier_verify.obj" 
 
 C_DEPS__QUOTED += \
-"main.d" 
+"carrier_verify.d" 
 
 C_SRCS__QUOTED += \
-"../main.c" 
+"../carrier_verify.c" 
 
 
