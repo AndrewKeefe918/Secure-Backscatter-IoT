@@ -164,24 +164,59 @@ def sideband_envelope(samples, carrier_offset,
 
 
 # ==================== Packet decoder (correlation) ====================
+# NCC threshold: 1.0 is a perfect template match, 0.0 is pure noise.
+# With slow 2 ms envelope blocks + MSP DCO jitter a clean packet scores
+# ~0.55-0.80, while background correlates at ~0.15-0.25.
+CORR_THRESHOLD = 0.40
+# When a peak is found, jitter the bit grid by ±TIMING_SEARCH env samples
+# to compensate for MSP clock drift over the 2.4 s packet.
+TIMING_SEARCH = 3
+# Fraction of each bit cell to average when sampling (centered).
+BIT_AVG_FRAC = 0.6
+
 class PacketDecoder:
     """
     Holds a rolling envelope buffer. On every update, slides a matched
-    filter for the preamble+sync bit pattern across the envelope. The peak
-    tells us exactly where bit 0 of the preamble starts, so we can sample
-    the 4 payload bytes at the correct bit centers.
+    filter for the preamble+sync bit pattern across the envelope, then
+    fine-tunes bit timing and samples each bit by averaging the middle
+    60 % of its cell.
     """
-    def __init__(self, env_buffer_seconds=6.0):
+    def __init__(self, env_buffer_seconds=6.0, verbose=True):
         max_env = int(env_buffer_seconds * 1000 / ENV_WINDOW_MS)
         self.env = deque(maxlen=max_env)
         self.last_decoded = ""
         self.packet_count = 0
         self.last_packet_time = 0.0
         self.last_corr = 0.0
+        self.verbose = verbose
+        self._last_report = 0.0
 
     def push(self, env_db):
         self.env.extend(env_db.tolist())
 
+    # --- helpers -------------------------------------------------------
+    @staticmethod
+    def _sample_bits(env, start, bits_n, thresh):
+        """Average BIT_AVG_FRAC of each bit cell and slice at `thresh`."""
+        half = int(ENV_PER_BIT * BIT_AVG_FRAC) // 2
+        bits = np.empty(bits_n, dtype=np.uint8)
+        levels = np.empty(bits_n, dtype=np.float32)
+        for i in range(bits_n):
+            c = start + i * ENV_PER_BIT + ENV_PER_BIT // 2
+            a = max(0, c - half)
+            b = min(len(env), c + half + 1)
+            levels[i] = env[a:b].mean()
+            bits[i] = 1 if levels[i] > thresh else 0
+        return bits, levels
+
+    @staticmethod
+    def _header_from_bits(bits16):
+        h = 0
+        for b in bits16:
+            h = (h << 1) | int(b)
+        return h
+
+    # --- main decode loop ---------------------------------------------
     def try_decode(self):
         need = PACKET_BITS * ENV_PER_BIT + len(SYNC_TEMPLATE)
         if len(self.env) < need:
@@ -189,69 +224,106 @@ class PacketDecoder:
 
         env = np.asarray(self.env, dtype=np.float32)
 
-        # Binary slice around a robust threshold (midpoint of 20/80 percentile).
-        lo, hi = np.percentile(env, [20, 80])
+        # 1. Quick activity gate: need >~3 dB of modulation somewhere.
+        lo, hi = np.percentile(env, [15, 85])
         if (hi - lo) < 2.0:
             self.last_corr = 0.0
-            return                              # no modulation on the air
-        thresh = 0.5 * (lo + hi)
-        binary = (env > thresh).astype(np.float32)
+            return
 
-        # Normalized cross-correlation against the preamble+sync template.
+        # 2. Normalized cross-correlation of the (zero-meaned) envelope
+        #    against the zero-mean sync template. This is the scalar-valued
+        #    NCC in [-1, +1] and does NOT depend on absolute dB level or
+        #    a pre-sliced binary decision.
+        env_zm = env - env.mean()
         tmpl = SYNC_TEMPLATE_ZM
-        # Only search positions where a full 48-bit packet fits after the match.
-        search_end = len(binary) - PACKET_BITS * ENV_PER_BIT
+        search_end = len(env) - PACKET_BITS * ENV_PER_BIT
         if search_end <= 0:
             return
-        # Use np.correlate in 'valid' mode for the template length,
-        # then restrict to positions where the payload also fits.
-        corr = np.correlate(binary - binary.mean(), tmpl, mode="valid")
-        corr = corr[: search_end + 1]
-        if corr.size == 0:
+        num = np.correlate(env_zm, tmpl, mode="valid")
+        num = num[: search_end + 1]
+        if num.size == 0:
             return
 
-        peak = int(np.argmax(corr))
-        peak_val = float(corr[peak]) / (SYNC_TEMPLATE_NORM + 1e-12)
+        # Per-position signal energy under the template window.
+        tlen = len(tmpl)
+        env_sq = env_zm.astype(np.float64) ** 2
+        csum = np.concatenate(([0.0], np.cumsum(env_sq)))
+        sig_e = csum[tlen:tlen + len(num)] - csum[:len(num)]
+        denom = np.sqrt(sig_e * (SYNC_TEMPLATE_NORM ** 2) + 1e-20)
+        ncc = num / denom
+
+        peak = int(np.argmax(ncc))
+        peak_val = float(ncc[peak])
         self.last_corr = peak_val
 
-        # Require a strong match (empirically ~8+ for a clean packet).
-        if peak_val < 6.0:
+        # Occasional near-miss diagnostic so the user can tune.
+        now = time.time()
+        if self.verbose and peak_val > 0.25 and peak_val < CORR_THRESHOLD \
+                and now - self._last_report > 1.5:
+            self._last_report = now
+            print(f"  near-miss: ncc={peak_val:.2f} "
+                  f"(thresh={CORR_THRESHOLD:.2f}, span={hi-lo:.1f} dB)")
+
+        if peak_val < CORR_THRESHOLD:
             return
 
-        # Sample each of the 48 bits at its center in the envelope.
-        bit_offset = peak + ENV_PER_BIT // 2
-        bits = np.empty(PACKET_BITS, dtype=np.uint8)
-        for i in range(PACKET_BITS):
-            idx = bit_offset + i * ENV_PER_BIT
-            bits[i] = 1 if env[idx] > thresh else 0
+        # 3. Fine timing search: jitter the bit grid ±TIMING_SEARCH env
+        #    samples and keep the offset whose header bits match exactly.
+        best = None
+        for dt in range(-TIMING_SEARCH, TIMING_SEARCH + 1):
+            start = peak + dt
+            if start < 0 or start + PACKET_BITS * ENV_PER_BIT > len(env):
+                continue
+            # Local threshold from just this packet window.
+            win = env[start:start + PACKET_BITS * ENV_PER_BIT]
+            w_lo, w_hi = np.percentile(win, [15, 85])
+            if (w_hi - w_lo) < 1.5:
+                continue
+            w_th = 0.5 * (w_lo + w_hi)
+            bits, levels = self._sample_bits(env, start, PACKET_BITS, w_th)
+            header = self._header_from_bits(bits[:16])
+            expected = (PREAMBLE_BYTE << 8) | SYNC_BYTE
+            # Score by number of header bits that match (0..16).
+            match = 16 - bin(header ^ expected).count("1")
+            if best is None or match > best[0]:
+                best = (match, dt, start, bits, levels, w_th)
 
-        # Verify preamble+sync survived the bit sampling.
-        header = 0
-        for b in bits[:16]:
-            header = (header << 1) | int(b)
-        if header != ((PREAMBLE_BYTE << 8) | SYNC_BYTE):
+        if best is None:
+            return
+        match, dt, start, bits, levels, w_th = best
+
+        # Allow up to 1 bit-error in the 16-bit header (Hamming distance 1).
+        if match < 15:
+            if self.verbose and now - self._last_report > 1.5:
+                self._last_report = now
+                expected = (PREAMBLE_BYTE << 8) | SYNC_BYTE
+                got = self._header_from_bits(bits[:16])
+                print(f"  header mismatch: got 0x{got:04X} want 0x{expected:04X} "
+                      f"(ncc={peak_val:.2f}, match={match}/16, dt={dt})")
             return
 
-        # Pack payload MSB-first.
+        # 4. Pack payload MSB-first.
         message = ""
+        raw = []
         for byte_i in range(PAYLOAD_BYTES):
             v = 0
             for j in range(8):
                 v = (v << 1) | int(bits[16 + byte_i * 8 + j])
+            raw.append(v)
             message += chr(v) if 32 <= v < 127 else "?"
 
-        now = time.time()
-        if now - self.last_packet_time > 1.0:
+        if now - self.last_packet_time > 0.5:
             self.packet_count += 1
             self.last_decoded = message
             self.last_packet_time = now
-            print(f"\n{'='*50}")
-            print(f"  PACKET #{self.packet_count} DECODED: \"{message}\""
-                  f"  (corr={peak_val:.1f})")
-            print(f"{'='*50}\n")
+            print(f"\n{'='*60}")
+            print(f"  PACKET #{self.packet_count}: \"{message}\"  "
+                  f"raw={['0x%02X' % v for v in raw]}  "
+                  f"(ncc={peak_val:.2f}, dt={dt}, match={match}/16)")
+            print(f"{'='*60}\n")
 
         # Drop the consumed envelope so we don't re-decode the same packet.
-        consume = peak + PACKET_BITS * ENV_PER_BIT
+        consume = start + PACKET_BITS * ENV_PER_BIT
         for _ in range(min(consume, len(self.env))):
             self.env.popleft()
 
