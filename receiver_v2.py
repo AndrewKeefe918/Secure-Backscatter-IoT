@@ -29,9 +29,9 @@ CARRIER_FINE_SEARCH_HZ = 1_500
 
 SUBCARRIER_HZ = 2000
 NOISE_REF_DELTA_HZ = 350
-BIT_DURATION_MS = 10
-BIT_DURATION_MIN_MS = 5
-BIT_DURATION_MAX_MS = 20
+BIT_DURATION_MS = 50
+BIT_DURATION_MIN_MS = 40
+BIT_DURATION_MAX_MS = 60
 ENV_WINDOW_MS = 5
 ENV_SAMPLES = SAMPLE_RATE * ENV_WINDOW_MS // 1000
 ENV_PER_BIT = BIT_DURATION_MS // ENV_WINDOW_MS
@@ -287,7 +287,11 @@ class PacketDecoder:
             est_epb = int(round(est_ms / ENV_WINDOW_MS))
             lo_epb = max(BIT_PERIOD_CANDIDATES[0], est_epb - 1)
             hi_epb = min(BIT_PERIOD_CANDIDATES[-1], est_epb + 1)
-            epb_candidates = tuple(range(lo_epb, hi_epb + 1))
+            if lo_epb <= hi_epb:
+                epb_candidates = tuple(range(lo_epb, hi_epb + 1))
+
+        if not epb_candidates:
+            epb_candidates = BIT_PERIOD_CANDIDATES
 
         max_epb = epb_candidates[-1]
         if len(self.env) < PACKET_BITS * max_epb + 16 * max_epb:

@@ -18,8 +18,10 @@
 
 #define PACKET_LENGTH           6
 #define SUBCARRIER_HZ_NOMINAL        1000U
-#define BIT_SUBCARRIER_PERIODS       50U
-#define GAP_BETWEEN_PACKETS_PERIODS  2000U
+/* CCR0 events occur every 500 us (toggle points), i.e. half a full
+ * 1 kHz square-wave period. Use "ticks" to avoid half-period mistakes. */
+#define BIT_SUBCARRIER_TICKS         100U   /* 50 ms nominal */
+#define GAP_BETWEEN_PACKETS_TICKS    4000U  /* 2 s nominal */
 
 const uint8_t packet[PACKET_LENGTH] = {
     0xAA,
@@ -33,14 +35,14 @@ const uint8_t packet[PACKET_LENGTH] = {
 /* Wait for N subcarrier timer periods using CCR0 flag events.
  * This keeps OOK bit timing locked to the same timer that generates
  * the subcarrier, avoiding software delay drift and clock mismatch. */
-static void wait_subcarrier_periods(uint16_t periods) {
-    while (periods--) {
+static void wait_subcarrier_ticks(uint16_t ticks) {
+    while (ticks--) {
         while ((TA0CCTL0 & CCIFG) == 0) {
             /* spin */
         }
         TA0CCTL0 &= ~CCIFG;
     }
-} /* end wait_subcarrier_periods */
+} /* end wait_subcarrier_ticks */
 
 /* Route the free-running 1 kHz timer output onto P1.1.
  *
@@ -70,7 +72,7 @@ void transmit_byte(uint8_t byte) {
         } else {
             subcarrier_off();
         } /* end if */
-        wait_subcarrier_periods(BIT_SUBCARRIER_PERIODS);
+        wait_subcarrier_ticks(BIT_SUBCARRIER_TICKS);
     } /* end for */
 } /* end transmit_byte */
 
@@ -111,7 +113,7 @@ int main(void) {
 
     while (1) {
         transmit_packet();
-        wait_subcarrier_periods(GAP_BETWEEN_PACKETS_PERIODS);
+        wait_subcarrier_ticks(GAP_BETWEEN_PACKETS_TICKS);
     } /* end while */
 
     return 0;
