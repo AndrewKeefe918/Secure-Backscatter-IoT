@@ -72,36 +72,56 @@ for i in range(5):
 print("Ready.\n")
 
 # ==================== Auto-center on the carrier ====================
-# Pluto's TCXO drifts by several kHz between power-ups, so the CW tone
-# almost never lands exactly at baseband DC. Retune rx_lo onto the
-# measured peak so the carrier ends up near 0 Hz in every plot.
+# Pluto's TCXO drifts by several kHz between power-ups. Iteratively
+# narrow the search window so a far-off spur in the ±50 kHz span can't
+# capture the lock.
+CARRIER_SEARCH_PASSES = [
+    (8_000, 300),   # ±8 kHz,  ignore DC ±300 Hz
+    (2_000, 150),   # ±2 kHz,  ignore DC ±150 Hz
+    (1_000,  80),   # ±1 kHz,  ignore DC ±80 Hz (fine)
+]
+
+def _measure_peak_offset(sdr_, n_bufs, span_hz, dc_guard_hz):
+    bufs = []
+    for _ in range(n_bufs):
+        try:
+            bufs.append(sdr_.rx())
+        except Exception:
+            pass
+    if not bufs:
+        return None, None
+    block = np.concatenate(bufs)
+    spec = np.fft.fftshift(np.fft.fft(block * np.hanning(len(block))))
+    fqs = np.fft.fftshift(np.fft.fftfreq(len(block), 1 / SAMPLE_RATE))
+    psd = np.abs(spec) ** 2
+    search = (np.abs(fqs) < span_hz) & (np.abs(fqs) > dc_guard_hz)
+    if not np.any(search):
+        return None, None
+    idx = int(np.argmax(np.where(search, psd, 0)))
+    peak_db = 10 * np.log10(psd[idx] + 1e-20)
+    notch = np.abs(fqs - fqs[idx]) < 200
+    floor_db = 10 * np.log10(np.median(psd[search & ~notch]) + 1e-20)
+    return float(fqs[idx]), float(peak_db - floor_db)
+
 print("Auto-centering on carrier...")
-cal_bufs = []
-for _ in range(16):
-    try:
-        cal_bufs.append(sdr.rx())
-    except Exception:
-        pass
-if cal_bufs:
-    cal = np.concatenate(cal_bufs)
-    cal_fft = np.fft.fftshift(np.fft.fft(cal * np.hanning(len(cal))))
-    cal_freqs = np.fft.fftshift(np.fft.fftfreq(len(cal), 1/SAMPLE_RATE))
-    psd = np.abs(cal_fft) ** 2
-    # Ignore DC (±100 Hz) so residual LO leakage doesn't win the argmax.
-    search = (np.abs(cal_freqs) < WIDE_SPAN_HZ) & (np.abs(cal_freqs) > 100)
-    psd_masked = np.where(search, psd, 0)
-    peak_offset = float(cal_freqs[int(np.argmax(psd_masked))])
-    new_lo = int(CENTER_FREQ + peak_offset)
-    print(f"  Peak at {peak_offset:+.0f} Hz -> retuning rx_lo to {new_lo} Hz")
+for span_hz, dc_guard in CARRIER_SEARCH_PASSES:
+    peak_off, peak_snr = _measure_peak_offset(sdr, 12, span_hz, dc_guard)
+    if peak_off is None:
+        print(f"  [span ±{span_hz} Hz] no buffers")
+        continue
+    if peak_snr is None or peak_snr < 8.0:
+        print(f"  [span ±{span_hz} Hz] peak at {peak_off:+.0f} Hz "
+              f"only {peak_snr:.1f} dB above floor, skipping retune")
+        continue
+    new_lo = int(sdr.rx_lo + peak_off)
+    print(f"  [span ±{span_hz} Hz] peak {peak_off:+.0f} Hz "
+          f"({peak_snr:.1f} dB SNR) -> rx_lo = {new_lo}")
     sdr.rx_lo = new_lo
-    # Drain a few buffers after retune.
-    for _ in range(5):
+    for _ in range(3):
         try:
             sdr.rx()
         except Exception:
             pass
-else:
-    print("  Skipped (no calibration buffers).")
 
 # ==================== Accumulation setup ====================
 ACCUM_LEN = 65536

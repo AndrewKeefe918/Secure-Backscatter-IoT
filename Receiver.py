@@ -31,11 +31,19 @@ SYNC_PATTERN_BITS = np.array(
     [(SYNC_BYTE     >> (7 - i)) & 1 for i in range(8)],
     dtype=np.float32,
 )
-# Template at envelope resolution: each bit becomes ENV_PER_BIT samples.
-SYNC_TEMPLATE = np.repeat(SYNC_PATTERN_BITS, ENV_PER_BIT)   # len = 16*25 = 400
-# Zero-mean matched filter so it is insensitive to DC level.
-SYNC_TEMPLATE_ZM = SYNC_TEMPLATE - SYNC_TEMPLATE.mean()
-SYNC_TEMPLATE_NORM = np.sqrt(np.sum(SYNC_TEMPLATE_ZM ** 2))
+
+# The MSP430's DCO is only ~1-3% accurate and the software delay_ms loop
+# has per-iteration overhead, so the real bit period is 50 ms +/- ~1.5 ms.
+# We build sync templates at a small set of bit periods and let the
+# decoder pick whichever gives the strongest NCC. Each tuple is
+# (env_per_bit, template_zm, template_norm).
+BIT_PERIOD_CANDIDATES = list(range(ENV_PER_BIT - 3, ENV_PER_BIT + 4))  # 22..28
+SYNC_TEMPLATES = []
+for _epb in BIT_PERIOD_CANDIDATES:
+    _t = np.repeat(SYNC_PATTERN_BITS, _epb).astype(np.float32)
+    _t_zm = _t - _t.mean()
+    _n = float(np.sqrt(np.sum(_t_zm ** 2)))
+    SYNC_TEMPLATES.append((_epb, _t_zm, _n))
 
 # ==================== SDR Connection ====================
 print("Connecting to Pluto...")
@@ -144,50 +152,23 @@ for span_hz, dc_guard in CARRIER_SEARCH_PASSES:
         except Exception:
             pass
 
-# ==================== Fine carrier offset (residual, after retune) ====================
-DETECTED_CARRIER_OFFSET = 0   # after retune the carrier should be ~0 Hz
-AUTO_DETECT = True            # measure residual offset for the decoder
-
-if AUTO_DETECT:
-    print("Measuring residual carrier offset...")
-    calibration_samples = []
-    for _ in range(16):
-        try:
-            calibration_samples.append(sdr.rx())
-        except Exception:
-            pass
-
-    if calibration_samples:
-        cal_block = np.concatenate(calibration_samples)
-        cal_windowed = cal_block * np.hanning(len(cal_block))
-        cal_fft = np.fft.fftshift(np.fft.fft(cal_windowed))
-        cal_freqs = np.fft.fftshift(np.fft.fftfreq(len(cal_block), 1/SAMPLE_RATE))
-        cal_psd = np.abs(cal_fft)**2
-
-        # Narrow search ±2 kHz, ignore DC (±50 Hz).
-        search_mask = (np.abs(cal_freqs) < 2000) & (np.abs(cal_freqs) > 50)
-        cal_psd_masked = cal_psd.copy()
-        cal_psd_masked[~search_mask] = 0
-        DETECTED_CARRIER_OFFSET = float(cal_freqs[int(np.argmax(cal_psd_masked))])
-
-print(f"Using carrier offset: {DETECTED_CARRIER_OFFSET:+.1f} Hz")
-print(f"Sidebands at: {DETECTED_CARRIER_OFFSET+SUBCARRIER_HZ:+.1f} Hz and {DETECTED_CARRIER_OFFSET-SUBCARRIER_HZ:+.1f} Hz\n")
+print(f"Sidebands at: {SUBCARRIER_HZ:+.0f} Hz and {-SUBCARRIER_HZ:+.0f} Hz\n")
 
 # ==================== Sideband Envelope ====================
-def sideband_envelope(samples, carrier_offset,
-                      fs=SAMPLE_RATE, freq=SUBCARRIER_HZ,
+def sideband_envelope(samples, fs=SAMPLE_RATE, freq=SUBCARRIER_HZ,
                       win=ENV_SAMPLES):
     """
-    Return one power value per `win` samples, measuring energy at
-    (carrier +/- freq) in dB. Length = len(samples) // win.
+    Return one power value (dB) per `win` samples, measuring energy at
+    +/-`freq` relative to baseband (i.e. the two OOK sidebands around the
+    centered carrier). Length = len(samples) // win.
     """
     n_full = (len(samples) // win) * win
     if n_full == 0:
         return np.empty(0)
     x = samples[:n_full].reshape(-1, win)
     t = np.arange(win) / fs
-    ref_u = np.exp(-2j * np.pi * (carrier_offset + freq) * t)
-    ref_l = np.exp(-2j * np.pi * (carrier_offset - freq) * t)
+    ref_u = np.exp(-2j * np.pi * freq * t)
+    ref_l = np.exp(+2j * np.pi * freq * t)
     pu = np.abs(x @ ref_u / win) ** 2
     pl = np.abs(x @ ref_l / win) ** 2
     return 10 * np.log10(pu + pl + 1e-20)
@@ -226,18 +207,16 @@ class PacketDecoder:
 
     # --- helpers -------------------------------------------------------
     @staticmethod
-    def _sample_bits(env, start, bits_n, thresh):
-        """Average BIT_AVG_FRAC of each bit cell and slice at `thresh`."""
-        half = int(ENV_PER_BIT * BIT_AVG_FRAC) // 2
+    def _sample_bits(env, start, bits_n, thresh, epb):
+        """Average BIT_AVG_FRAC of each bit cell (width = epb) and slice."""
+        half = int(epb * BIT_AVG_FRAC) // 2
         bits = np.empty(bits_n, dtype=np.uint8)
-        levels = np.empty(bits_n, dtype=np.float32)
         for i in range(bits_n):
-            c = start + i * ENV_PER_BIT + ENV_PER_BIT // 2
+            c = start + i * epb + epb // 2
             a = max(0, c - half)
             b = min(len(env), c + half + 1)
-            levels[i] = env[a:b].mean()
-            bits[i] = 1 if levels[i] > thresh else 0
-        return bits, levels
+            bits[i] = 1 if env[a:b].mean() > thresh else 0
+        return bits
 
     @staticmethod
     def _header_from_bits(bits16):
@@ -246,90 +225,103 @@ class PacketDecoder:
             h = (h << 1) | int(b)
         return h
 
+    @staticmethod
+    def _best_ncc(env_zm, tmpl_zm, tmpl_norm, max_start):
+        """NCC of `tmpl_zm` against `env_zm`, valid mode, clipped to max_start."""
+        tlen = len(tmpl_zm)
+        if len(env_zm) < tlen + 1 or max_start <= 0:
+            return -1.0, 0
+        num = np.correlate(env_zm, tmpl_zm, mode="valid")
+        num = num[: max_start + 1]
+        if num.size == 0:
+            return -1.0, 0
+        env_sq = env_zm.astype(np.float64) ** 2
+        csum = np.concatenate(([0.0], np.cumsum(env_sq)))
+        sig_e = csum[tlen:tlen + len(num)] - csum[:len(num)]
+        denom = np.sqrt(sig_e * (tmpl_norm ** 2) + 1e-20)
+        ncc = num / denom
+        idx = int(np.argmax(ncc))
+        return float(ncc[idx]), idx
+
     # --- main decode loop ---------------------------------------------
     def try_decode(self):
-        need = PACKET_BITS * ENV_PER_BIT + len(SYNC_TEMPLATE)
+        # Need room for widest template + widest packet.
+        max_epb = BIT_PERIOD_CANDIDATES[-1]
+        need = PACKET_BITS * max_epb + 16 * max_epb
         if len(self.env) < need:
             return
 
         env = np.asarray(self.env, dtype=np.float32)
 
-        # 1. Quick activity gate: need >~3 dB of modulation somewhere.
+        # 1. Activity gate: need at least ~1.5 dB of modulation somewhere.
         lo, hi = np.percentile(env, [15, 85])
-        if (hi - lo) < 2.0:
+        if (hi - lo) < 1.5:
             self.last_corr = 0.0
             return
 
-        # 2. Normalized cross-correlation of the (zero-meaned) envelope
-        #    against the zero-mean sync template. This is the scalar-valued
-        #    NCC in [-1, +1] and does NOT depend on absolute dB level or
-        #    a pre-sliced binary decision.
         env_zm = env - env.mean()
-        tmpl = SYNC_TEMPLATE_ZM
-        search_end = len(env) - PACKET_BITS * ENV_PER_BIT
-        if search_end <= 0:
-            return
-        num = np.correlate(env_zm, tmpl, mode="valid")
-        num = num[: search_end + 1]
-        if num.size == 0:
-            return
 
-        # Per-position signal energy under the template window.
-        tlen = len(tmpl)
-        env_sq = env_zm.astype(np.float64) ** 2
-        csum = np.concatenate(([0.0], np.cumsum(env_sq)))
-        sig_e = csum[tlen:tlen + len(num)] - csum[:len(num)]
-        denom = np.sqrt(sig_e * (SYNC_TEMPLATE_NORM ** 2) + 1e-20)
-        ncc = num / denom
+        # 2. Multi-rate matched filter: pick the bit period with the
+        #    highest NCC. MSP DCO drift shows up as a non-25 winner.
+        best_peak = -1.0
+        best_epb = ENV_PER_BIT
+        best_pos = 0
+        per_rate = []
+        for epb, tmpl, tnorm in SYNC_TEMPLATES:
+            max_start = len(env) - PACKET_BITS * epb
+            val, pos = self._best_ncc(env_zm, tmpl, tnorm, max_start)
+            per_rate.append((epb, val))
+            if val > best_peak:
+                best_peak = val
+                best_epb = epb
+                best_pos = pos
 
-        peak = int(np.argmax(ncc))
-        peak_val = float(ncc[peak])
-        self.last_corr = peak_val
+        self.last_corr = best_peak
 
-        # Occasional near-miss diagnostic so the user can tune.
         now = time.time()
-        if self.verbose and peak_val > 0.25 and peak_val < CORR_THRESHOLD \
+        if self.verbose and 0.25 < best_peak < CORR_THRESHOLD \
                 and now - self._last_report > 1.5:
             self._last_report = now
-            print(f"  near-miss: ncc={peak_val:.2f} "
-                  f"(thresh={CORR_THRESHOLD:.2f}, span={hi-lo:.1f} dB)")
+            rates = " ".join(f"{e}:{v:.2f}" for e, v in per_rate)
+            print(f"  near-miss: best ncc={best_peak:.2f} "
+                  f"@ epb={best_epb} (span={hi-lo:.1f} dB)  rates[{rates}]")
 
-        if peak_val < CORR_THRESHOLD:
+        if best_peak < CORR_THRESHOLD:
             return
 
-        # 3. Fine timing search: jitter the bit grid ±TIMING_SEARCH env
-        #    samples and keep the offset whose header bits match exactly.
+        # 3. Fine timing search: jitter the bit grid around best_pos and
+        #    keep the offset whose header matches most bits (allowing 1
+        #    bit-error in the 16-bit header).
+        epb = best_epb
+        packet_len = PACKET_BITS * epb
         best = None
         for dt in range(-TIMING_SEARCH, TIMING_SEARCH + 1):
-            start = peak + dt
-            if start < 0 or start + PACKET_BITS * ENV_PER_BIT > len(env):
+            start = best_pos + dt
+            if start < 0 or start + packet_len > len(env):
                 continue
-            # Local threshold from just this packet window.
-            win = env[start:start + PACKET_BITS * ENV_PER_BIT]
+            win = env[start:start + packet_len]
             w_lo, w_hi = np.percentile(win, [15, 85])
-            if (w_hi - w_lo) < 1.5:
+            if (w_hi - w_lo) < 1.2:
                 continue
             w_th = 0.5 * (w_lo + w_hi)
-            bits, levels = self._sample_bits(env, start, PACKET_BITS, w_th)
+            bits = self._sample_bits(env, start, PACKET_BITS, w_th, epb)
             header = self._header_from_bits(bits[:16])
             expected = (PREAMBLE_BYTE << 8) | SYNC_BYTE
-            # Score by number of header bits that match (0..16).
             match = 16 - bin(header ^ expected).count("1")
             if best is None or match > best[0]:
-                best = (match, dt, start, bits, levels, w_th)
+                best = (match, dt, start, bits)
 
         if best is None:
             return
-        match, dt, start, bits, levels, w_th = best
+        match, dt, start, bits = best
 
-        # Allow up to 1 bit-error in the 16-bit header (Hamming distance 1).
         if match < 15:
             if self.verbose and now - self._last_report > 1.5:
                 self._last_report = now
                 expected = (PREAMBLE_BYTE << 8) | SYNC_BYTE
                 got = self._header_from_bits(bits[:16])
                 print(f"  header mismatch: got 0x{got:04X} want 0x{expected:04X} "
-                      f"(ncc={peak_val:.2f}, match={match}/16, dt={dt})")
+                      f"(ncc={best_peak:.2f}, epb={epb}, dt={dt}, match={match}/16)")
             return
 
         # 4. Pack payload MSB-first.
@@ -346,14 +338,16 @@ class PacketDecoder:
             self.packet_count += 1
             self.last_decoded = message
             self.last_packet_time = now
+            bit_ms = epb * ENV_WINDOW_MS
             print(f"\n{'='*60}")
             print(f"  PACKET #{self.packet_count}: \"{message}\"  "
-                  f"raw={['0x%02X' % v for v in raw]}  "
-                  f"(ncc={peak_val:.2f}, dt={dt}, match={match}/16)")
+                  f"raw={['0x%02X' % v for v in raw]}")
+            print(f"    ncc={best_peak:.2f}  bit={bit_ms} ms  dt={dt}  "
+                  f"header={match}/16")
             print(f"{'='*60}\n")
 
         # Drop the consumed envelope so we don't re-decode the same packet.
-        consume = start + PACKET_BITS * ENV_PER_BIT
+        consume = start + packet_len
         for _ in range(min(consume, len(self.env))):
             self.env.popleft()
 
@@ -363,7 +357,7 @@ NUM_BUFFERS = ACCUM_LEN // BUFFER_SIZE
 
 freqs = np.fft.fftshift(np.fft.fftfreq(ACCUM_LEN, 1/SAMPLE_RATE))
 wide_mask = (freqs >= -WIDE_SPAN_HZ) & (freqs <= WIDE_SPAN_HZ)
-zoom_mask = (freqs >= DETECTED_CARRIER_OFFSET - ZOOM_SPAN_HZ) & (freqs <= DETECTED_CARRIER_OFFSET + ZOOM_SPAN_HZ)
+zoom_mask = (freqs >= -ZOOM_SPAN_HZ) & (freqs <= ZOOM_SPAN_HZ)
 freqs_wide = freqs[wide_mask]
 freqs_zoom = freqs[zoom_mask]
 
@@ -390,7 +384,7 @@ decoder = PacketDecoder(env_buffer_seconds=PLOT_HISTORY_SEC)
 start_time = time.time()
 
 print(f"Receiver running. Looking for 'OPEN' packets...")
-print(f"Detection frequencies: {DETECTED_CARRIER_OFFSET-1000:+.0f} Hz and {DETECTED_CARRIER_OFFSET+1000:+.0f} Hz")
+print(f"Detection frequencies: {-SUBCARRIER_HZ:+.0f} Hz and {+SUBCARRIER_HZ:+.0f} Hz")
 print("Ctrl+C to stop.\n")
 
 frame = 0
@@ -412,7 +406,7 @@ try:
         samples = np.concatenate(buffers)
 
         # --- Bit-level detection via matched filter on sideband envelope ---
-        env_db = sideband_envelope(samples, DETECTED_CARRIER_OFFSET)
+        env_db = sideband_envelope(samples)
         decoder.push(env_db)
         decoder.try_decode()
 
@@ -441,26 +435,25 @@ try:
         psd_db = 10 * np.log10(psd_accumulator + 1e-20)
         psd_wide = psd_db[wide_mask]
         psd_zoom = psd_db[zoom_mask]
-        
-        freqs_zoom_rel = freqs_zoom - DETECTED_CARRIER_OFFSET
+
         peak_power = np.max(psd_zoom)
 
         ax_wide.clear()
         ax_wide.plot(freqs_wide / 1000, psd_wide, linewidth=0.6, color='steelblue')
-        ax_wide.axvline(DETECTED_CARRIER_OFFSET/1000, color='green', linestyle='--', alpha=0.5)
+        ax_wide.axvline(0, color='green', linestyle='--', alpha=0.5)
         ax_wide.set_xlabel('Offset (kHz)')
         ax_wide.set_ylabel('Power (dB)')
         ax_wide.set_title(f'Wide View ±{WIDE_SPAN_HZ/1000:.0f} kHz')
         ax_wide.grid(True, alpha=0.3)
         
         ax_zoom.clear()
-        ax_zoom.plot(freqs_zoom_rel, psd_zoom, linewidth=0.8, color='steelblue')
+        ax_zoom.plot(freqs_zoom, psd_zoom, linewidth=0.8, color='steelblue')
         ax_zoom.axvline(0, color='green', linestyle='--', alpha=0.5, label='Carrier')
         ax_zoom.axvline(1000, color='red', linestyle='--', alpha=0.6, label='±1 kHz sideband')
         ax_zoom.axvline(-1000, color='red', linestyle='--', alpha=0.6)
         ax_zoom.set_xlabel('Offset from carrier (Hz)')
         ax_zoom.set_ylabel('Power (dB)')
-        ax_zoom.set_title(f'Zoomed View | Carrier {peak_power:.1f} dB @ {DETECTED_CARRIER_OFFSET:+.0f} Hz')
+        ax_zoom.set_title(f'Zoomed View | Carrier {peak_power:.1f} dB')
         ax_zoom.set_xlim(-ZOOM_SPAN_HZ, ZOOM_SPAN_HZ)
         ax_zoom.grid(True, alpha=0.3)
         ax_zoom.legend(loc='upper right', fontsize=8)
@@ -489,7 +482,7 @@ try:
             ax_power.set_title(f'Sideband envelope  |  '
                                f'Packets decoded: {decoder.packet_count}  |  '
                                f'Last: "{decoder.last_decoded}"  |  '
-                               f'corr: {decoder.last_corr:.1f}')
+                               f'ncc: {decoder.last_corr:.2f}')
             ax_power.grid(True, alpha=0.3)
         
         plt.tight_layout()
