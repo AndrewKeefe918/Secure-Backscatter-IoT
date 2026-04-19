@@ -6,9 +6,9 @@ from collections import deque
 
 # ==================== Configuration ====================
 CENTER_FREQ = 2_479_991_600
-SAMPLE_RATE = 1_000_000
+SAMPLE_RATE = 521_000
 BUFFER_SIZE = 4096
-RX_GAIN = 50
+RX_GAIN = 15
 WIDE_SPAN_HZ = 50_000
 ZOOM_SPAN_HZ = 5_000
 

@@ -7,7 +7,7 @@ try:
     
     # Exciter configuration
     sdr.tx_lo = int(2480000000)
-    sdr.tx_hardwaregain_chan0 = -10   # NOT zero - start lower to avoid overload
+    sdr.tx_hardwaregain_chan0 = -5   # NOT zero - start lower to avoid overload
     sdr.sample_rate = int(2e6)
     sdr.tx_cyclic_buffer = True
     
