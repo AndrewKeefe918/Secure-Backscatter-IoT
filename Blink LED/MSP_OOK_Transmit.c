@@ -35,16 +35,21 @@ static void delay_ms(uint16_t ms) {
     }
 } /* end delay_ms */
 
+/* Route the free-running 1 kHz timer output onto P1.1.
+ *
+ * The timer is started once in main() and NEVER stopped or cleared.
+ * We gate the subcarrier only by (dis)connecting the pin via P1SEL,
+ * so the 1 kHz phase stays continuous across bit boundaries. Stopping
+ * or TACLR'ing the timer on every '1' (as the previous version did)
+ * restarted the phase each bit, producing broadband spectral splatter
+ * around the +/- 1 kHz sidebands.
+ */
 static void subcarrier_on(void) {
-    TA0CTL |= TACLR;
-    P1OUT &= ~BIT1;
     P1SEL |= BIT1;
-    TA0CTL = TASSEL_2 | MC_1;
     P1OUT |= BIT6;
 } /* end subcarrier_on */
 
 static void subcarrier_off(void) {
-    TA0CTL = TASSEL_2 | MC_0;
     P1SEL &= ~BIT1;
     P1OUT &= ~BIT1;
     P1OUT &= ~BIT6;
@@ -81,13 +86,17 @@ int main(void) {
         DCOCTL = CALDCO_1MHZ;
     } /* end if */
 
-    P1DIR |= (BIT0 | BIT1 | BIT6);
-    P1OUT &= ~(BIT0 | BIT1 | BIT6);
+    P1DIR  |= (BIT0 | BIT1 | BIT6);
+    P1OUT  &= ~(BIT0 | BIT1 | BIT6);
+    P1SEL  &= ~BIT1;                /* start as GPIO low (subcarrier off) */
     P1SEL2 &= ~BIT1;
 
-    TA0CCR0 = 499;
+    /* Timer_A0: SMCLK (1 MHz), up mode, toggle on CCR0.
+     * CCR0 = 499 -> toggle every 500 us -> 1 kHz square wave.
+     * Start it ONCE and leave it running forever. */
+    TA0CCR0  = 499;
     TA0CCTL0 = OUTMOD_4;
-    TA0CTL = TASSEL_2 | MC_0;
+    TA0CTL   = TASSEL_2 | MC_1 | TACLR;
 
     while (1) {
         transmit_packet();
