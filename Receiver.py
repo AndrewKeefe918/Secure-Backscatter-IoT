@@ -304,6 +304,8 @@ class PacketDecoder:
         epb = best_epb
         packet_len = PACKET_BITS * epb
         best = None
+        rejected_noisy = 0
+        rejected_header = []
         for dt in range(-TIMING_SEARCH, TIMING_SEARCH + 1):
             start = best_pos + dt
             if start < 0 or start + packet_len > len(env):
@@ -311,19 +313,23 @@ class PacketDecoder:
             win = env[start:start + packet_len]
             w_lo, w_hi = np.percentile(win, [15, 85])
             if (w_hi - w_lo) < 1.2:
+                rejected_noisy += 1
                 continue
             w_th = 0.5 * (w_lo + w_hi)
             bits = self._sample_bits(env, start, PACKET_BITS, w_th, epb)
             header = self._header_from_bits(bits[:16])
             expected = (PREAMBLE_BYTE << 8) | SYNC_BYTE
             match = 16 - bin(header ^ expected).count("1")
+            rejected_header.append((dt, header, match))
             if best is None or match > best[0]:
                 best = (match, dt, start, bits)
 
         if best is None:
             if self.verbose and now - self._last_report > 1.0:
                 self._last_report = now
-                print(f"    → timing search failed: no valid window (all too noisy or out of bounds)")
+                print(f"    → timing search: {rejected_noisy} windows too noisy, {len(rejected_header)} tested headers:")
+                for dt, hdr, m in rejected_header:
+                    print(f"       dt={dt:+d}: 0x{hdr:04X} ({m}/16 match)")
             return
         match, dt, start, bits = best
 
