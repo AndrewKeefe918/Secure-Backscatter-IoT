@@ -27,7 +27,8 @@ ZOOM_SPAN_HZ = 12_000
 CARRIER_COARSE_SEARCH_HZ = 12_000
 CARRIER_FINE_SEARCH_HZ = 1_500
 
-SUBCARRIER_HZ = 2000
+# Must match the MSP firmware subcarrier (Timer_A CCR0 toggle rate).
+SUBCARRIER_HZ = 1000
 NOISE_REF_DELTA_HZ = 350
 BIT_DURATION_MS = 50
 BIT_DURATION_MIN_MS = 40
@@ -49,7 +50,7 @@ ACTIVITY_MIN_SPAN_DB = 2.5
 WINDOW_MIN_SPAN_DB = 1.0
 PAYLOAD_MIN_MATCH = 24
 PACKET_MIN_MATCH = 38
-NO_ACTIVITY_RESCAN_SEC = 8.0
+SYNC_MIN_MATCH = 14   # out of 16 preamble+sync bits
 
 _min_epb = max(1, int(round(BIT_DURATION_MIN_MS / ENV_WINDOW_MS)))
 _max_epb = max(_min_epb, int(round(BIT_DURATION_MAX_MS / ENV_WINDOW_MS)))
@@ -109,8 +110,7 @@ def drain(sdr, n=4):
 
 
 def scan_sidebands(sdr, carrier_offset, n_bufs=32,
-                   freqs_hz=(500, 750, 1000, 1500, 2000, 2500, 3000,
-                             3500, 4000, 5000, 6000, 7000, 8000),
+                   freqs_hz=(1000, 3000, 5000, 7000),
                    noise_delta=NOISE_REF_DELTA_HZ):
     """
     One-shot sideband scan: for each candidate f, measure pair power at
@@ -238,8 +238,9 @@ def median_filter_1d(x, kernel=5):
         kernel += 1
     pad = kernel // 2
     xp = np.pad(x, (pad, pad), mode="edge")
-    return np.array([np.median(xp[i:i + kernel]) for i in range(len(x))],
-                    dtype=np.float32)
+    # Vectorized sliding-window median.
+    win = np.lib.stride_tricks.sliding_window_view(xp, kernel)
+    return np.median(win, axis=1).astype(np.float32)
 
 
 # ==================== Packet decoder ====================
@@ -279,20 +280,8 @@ class PacketDecoder:
         return float(ncc[idx]), idx
 
     def try_decode(self):
-        epb_candidates = BIT_PERIOD_CANDIDATES
         env = np.asarray(self.env, dtype=np.float32)
-        est = estimate_bit_duration_ms(env, min_span_db=ACTIVITY_MIN_SPAN_DB)
-        if est is not None:
-            est_ms = est[0]
-            est_epb = int(round(est_ms / ENV_WINDOW_MS))
-            lo_epb = max(BIT_PERIOD_CANDIDATES[0], est_epb - 1)
-            hi_epb = min(BIT_PERIOD_CANDIDATES[-1], est_epb + 1)
-            if lo_epb <= hi_epb:
-                epb_candidates = tuple(range(lo_epb, hi_epb + 1))
-
-        if not epb_candidates:
-            epb_candidates = BIT_PERIOD_CANDIDATES
-
+        epb_candidates = BIT_PERIOD_CANDIDATES
         max_epb = epb_candidates[-1]
         if len(self.env) < PACKET_BITS * max_epb + 16 * max_epb:
             return
@@ -316,7 +305,9 @@ class PacketDecoder:
 
         epb = best_epb
         packet_len = PACKET_BITS * epb
+        sync_bits_expected = _expected_packet_bits[:16]
         best = None
+        # Lock timing using ONLY the preamble+sync (deterministic, known pattern).
         for dt in range(-TIMING_SEARCH, TIMING_SEARCH + 1):
             start = best_pos + dt
             if start < 0 or start + packet_len > len(env):
@@ -327,18 +318,20 @@ class PacketDecoder:
                 continue
             th = 0.5 * (w_lo + w_hi)
             bits = self._sample_bits(env, start, PACKET_BITS, th, epb)
-            pkt_match = int(np.sum(bits == _expected_packet_bits))
-            if best is None or pkt_match > best[0]:
-                best = (pkt_match, dt, start, bits)
+            sync_match = int(np.sum(bits[:16] == sync_bits_expected))
+            if best is None or sync_match > best[0]:
+                best = (sync_match, dt, start, bits)
 
         if best is None:
             return
-        pkt_match, dt, start, bits = best
-        if pkt_match < PACKET_MIN_MATCH:
+        sync_match, dt, start, bits = best
+        # Hard gate: preamble+sync must be nearly perfect.
+        if sync_match < SYNC_MIN_MATCH:
             return
         payload_match = int(np.sum(bits[16:] == _expected_packet_bits[16:]))
         if payload_match < PAYLOAD_MIN_MATCH:
             return
+        pkt_match = sync_match + payload_match
 
         raw = []
         message = ""
@@ -358,7 +351,8 @@ class PacketDecoder:
             print(f"  PACKET #{self.packet_count}  \"{message}\"  "
                   f"[{' '.join('0x%02X' % v for v in raw)}]")
             print(f"  ncc={best_peak:.3f}  epb={epb}  dt={dt:+d}  "
-                  f"match={pkt_match}/48  payload={payload_match}/32")
+                  f"sync={sync_match}/16  payload={payload_match}/32  "
+                  f"match={pkt_match}/48")
             print(f"{'=' * 60}\n")
 
         for _ in range(min(start + packet_len, len(self.env))):
@@ -386,20 +380,17 @@ def main():
     accum_len = 65536
     n_bufs_per_frame = accum_len // BUFFER_SIZE
     freqs = np.fft.fftshift(np.fft.fftfreq(accum_len, 1 / SAMPLE_RATE))
-    wide_mask = (freqs >= -WIDE_SPAN_HZ) & (freqs <= WIDE_SPAN_HZ)
     zoom_mask = (freqs >= -ZOOM_SPAN_HZ) & (freqs <= ZOOM_SPAN_HZ)
-    freqs_wide = freqs[wide_mask]
     freqs_zoom = freqs[zoom_mask]
     fft_win = np.hanning(accum_len)
     fft_gain = float(np.sum(fft_win ** 2))
 
     plt.ion()
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 0.8])
-    ax_wide  = fig.add_subplot(gs[0, 0])
-    ax_zoom  = fig.add_subplot(gs[0, 1])
-    ax_wf    = fig.add_subplot(gs[1, :])
-    ax_power = fig.add_subplot(gs[2, :])
+    fig = plt.figure(figsize=(14, 9))
+    gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 0.8])
+    ax_zoom  = fig.add_subplot(gs[0, 0])
+    ax_wf    = fig.add_subplot(gs[1, 0])
+    ax_power = fig.add_subplot(gs[2, 0])
 
     wf_rows = 150
     wf = np.full((wf_rows, len(freqs_zoom)), -100.0)
@@ -422,7 +413,6 @@ def main():
     PLOT_EVERY = 4
     frame = 0
     last_bitdur_print = 0.0
-    last_activity_ts = time.time()
     try:
         while True:
             bufs = []
@@ -436,16 +426,6 @@ def main():
             env_db = median_filter_1d(sideband_envelope(samples, carrier_offset, freq=subcarrier_hz))
             decoder.push(env_db)
             decoder.try_decode()
-
-            if len(env_db):
-                env_span = float(np.percentile(env_db, 85) - np.percentile(env_db, 15))
-                if env_span >= ACTIVITY_MIN_SPAN_DB:
-                    last_activity_ts = time.time()
-                elif (time.time() - last_activity_ts) > NO_ACTIVITY_RESCAN_SEC:
-                    print(f"[retune] low activity for {NO_ACTIVITY_RESCAN_SEC:.0f}s, re-scanning sidebands...")
-                    subcarrier_hz = scan_sidebands(sdr, carrier_offset)
-                    print(f"[retune] now using +/-{subcarrier_hz} Hz sidebands")
-                    last_activity_ts = time.time()
 
             now_rel = time.time() - t_start
             for i, v in enumerate(env_db):
@@ -478,17 +458,8 @@ def main():
             psd = np.abs(fft) ** 2 / fft_gain
             psd_avg = psd.copy() if psd_avg is None else 0.7 * psd_avg + 0.3 * psd
             psd_db   = 10 * np.log10(psd_avg + 1e-20)
-            psd_wide = psd_db[wide_mask]
             psd_zoom = psd_db[zoom_mask]
             peak_power = float(np.max(psd_zoom))
-
-            ax_wide.clear()
-            ax_wide.plot(freqs_wide / 1000, psd_wide, lw=0.6, color="steelblue")
-            ax_wide.axvline(0, color="green", ls="--", alpha=0.5)
-            ax_wide.set_xlabel("Offset (kHz)")
-            ax_wide.set_ylabel("Power (dB)")
-            ax_wide.set_title(f"Wide View +/-{WIDE_SPAN_HZ / 1000:.0f} kHz")
-            ax_wide.grid(True, alpha=0.3)
 
             ax_zoom.clear()
             ax_zoom.plot(freqs_zoom, psd_zoom, lw=0.8, color="steelblue")

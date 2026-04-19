@@ -1,33 +1,43 @@
+"""
+Exciter: park a CW tone at 2.48 GHz for the backscatter tag to reflect.
+The receiver auto-locates the carrier, so exact TX LO only has to be close.
+"""
+
+import time
+
 import adi
 import numpy as np
-import time
+
+TX_LO_HZ         = 2_480_000_000
+TX_SAMPLE_RATE   = int(2e6)
+TX_HARDWAREGAIN  = -5     # keep below 0 dB to avoid front-end overload
+IQ_LEN           = 1024
+IQ_AMPLITUDE     = 2 ** 14
 
 try:
     sdr = adi.Pluto("ip:192.168.2.1")
-    
-    # Exciter configuration
-    sdr.tx_lo = int(2480000000)
-    sdr.tx_hardwaregain_chan0 = -5   # NOT zero - start lower to avoid overload
-    sdr.sample_rate = int(2e6)
-    sdr.tx_cyclic_buffer = True
-    
-    # True CW: zero baseband signal → pure LO leakage (the carrier)
-    # Actually, we want a non-zero DC offset so the AD9361 doesn't null it
-    # Use a modest-amplitude constant
-    N = 1024
-    iq = np.ones(N, dtype=np.complex64) * (2**14)   # constant I, constant Q
-    
+
+    sdr.tx_lo                  = TX_LO_HZ
+    sdr.tx_hardwaregain_chan0  = TX_HARDWAREGAIN
+    sdr.sample_rate            = TX_SAMPLE_RATE
+    sdr.tx_cyclic_buffer       = True
+
+    # Constant IQ -> pure tone at TX_LO (DC in baseband avoids the
+    # AD9361 DC-null servo by providing a real non-zero baseband).
+    iq = np.ones(IQ_LEN, dtype=np.complex64) * IQ_AMPLITUDE
     sdr.tx(iq)
-    
-    print("\n[SUCCESS] Exciter is LIVE at 2.48 GHz (CW)")
-    print("Press Ctrl+C to stop.\n")
-    
+
+    print(f"[exciter] CW live at {TX_LO_HZ/1e9:.4f} GHz, gain {TX_HARDWAREGAIN} dB.")
+    print("Press Ctrl+C to stop.")
     while True:
         time.sleep(1)
 
 except KeyboardInterrupt:
-    print("\nShutting down exciter...")
-    sdr.tx_destroy_buffer()   # Critical - stops transmission cleanly
-    print("Done.")
+    print("\n[exciter] stopping...")
+    try:
+        sdr.tx_destroy_buffer()
+    except Exception:
+        pass
+    print("[exciter] done.")
 except Exception as e:
-    print(f"\n[ERROR] Could not start Exciter: {e}")
+    print(f"[exciter] error: {e}")
