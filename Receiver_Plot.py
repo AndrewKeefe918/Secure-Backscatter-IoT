@@ -29,6 +29,38 @@ sdr.rx_buffer_size = BUFFER_SIZE
 sdr.gain_control_mode_chan0 = "manual"
 sdr.rx_hardwaregain_chan0 = RX_GAIN
 
+# Enable AD9361 quadrature + RF-DC tracking to suppress the IQ image
+# (the mirrored peak at -f_carrier). Image rejection typically goes from
+# ~30 dB out of the box to >55 dB with tracking on. The attribute names
+# vary slightly between pyadi-iio versions, so we try a few.
+def _enable_tracking(sdr_):
+    tried = []
+    for attr, val in [
+        ("rx_quadrature_tracking_en_chan0", True),
+        ("rx_rf_dc_offset_tracking_en_chan0", True),
+        ("rx_bb_dc_offset_tracking_en_chan0", True),
+    ]:
+        try:
+            setattr(sdr_, attr, val)
+            tried.append(attr)
+        except Exception:
+            pass
+    # Fallback: write the underlying iio attrs directly.
+    try:
+        ch = sdr_._ctrl.find_channel("voltage0", False)
+        for name in ("quadrature_tracking_en",
+                     "rf_dc_offset_tracking_en",
+                     "bb_dc_offset_tracking_en"):
+            if name in ch.attrs:
+                ch.attrs[name].value = "1"
+                tried.append(f"ctrl:{name}")
+    except Exception:
+        pass
+    return tried
+
+enabled = _enable_tracking(sdr)
+print(f"  Tracking enabled: {enabled or 'none (older pyadi-iio)'}")
+
 # Warmup
 print("\nWarming up...")
 for i in range(5):
@@ -38,6 +70,38 @@ for i in range(5):
         print(f"  Warmup {i}: {e}")
         time.sleep(0.2)
 print("Ready.\n")
+
+# ==================== Auto-center on the carrier ====================
+# Pluto's TCXO drifts by several kHz between power-ups, so the CW tone
+# almost never lands exactly at baseband DC. Retune rx_lo onto the
+# measured peak so the carrier ends up near 0 Hz in every plot.
+print("Auto-centering on carrier...")
+cal_bufs = []
+for _ in range(16):
+    try:
+        cal_bufs.append(sdr.rx())
+    except Exception:
+        pass
+if cal_bufs:
+    cal = np.concatenate(cal_bufs)
+    cal_fft = np.fft.fftshift(np.fft.fft(cal * np.hanning(len(cal))))
+    cal_freqs = np.fft.fftshift(np.fft.fftfreq(len(cal), 1/SAMPLE_RATE))
+    psd = np.abs(cal_fft) ** 2
+    # Ignore DC (±100 Hz) so residual LO leakage doesn't win the argmax.
+    search = (np.abs(cal_freqs) < WIDE_SPAN_HZ) & (np.abs(cal_freqs) > 100)
+    psd_masked = np.where(search, psd, 0)
+    peak_offset = float(cal_freqs[int(np.argmax(psd_masked))])
+    new_lo = int(CENTER_FREQ + peak_offset)
+    print(f"  Peak at {peak_offset:+.0f} Hz -> retuning rx_lo to {new_lo} Hz")
+    sdr.rx_lo = new_lo
+    # Drain a few buffers after retune.
+    for _ in range(5):
+        try:
+            sdr.rx()
+        except Exception:
+            pass
+else:
+    print("  Skipped (no calibration buffers).")
 
 # ==================== Accumulation setup ====================
 ACCUM_LEN = 65536

@@ -52,6 +52,32 @@ sdr.rx_buffer_size = BUFFER_SIZE
 sdr.gain_control_mode_chan0 = "manual"
 sdr.rx_hardwaregain_chan0 = RX_GAIN
 
+# Enable AD9361 quadrature + DC-offset tracking. This suppresses the IQ
+# image (mirrored peak at -f_carrier) from ~30 dB to >55 dB of rejection.
+def _enable_tracking(sdr_):
+    tried = []
+    for attr in ("rx_quadrature_tracking_en_chan0",
+                 "rx_rf_dc_offset_tracking_en_chan0",
+                 "rx_bb_dc_offset_tracking_en_chan0"):
+        try:
+            setattr(sdr_, attr, True)
+            tried.append(attr)
+        except Exception:
+            pass
+    try:
+        ch = sdr_._ctrl.find_channel("voltage0", False)
+        for name in ("quadrature_tracking_en",
+                     "rf_dc_offset_tracking_en",
+                     "bb_dc_offset_tracking_en"):
+            if name in ch.attrs:
+                ch.attrs[name].value = "1"
+                tried.append(f"ctrl:{name}")
+    except Exception:
+        pass
+    return tried
+
+print(f"Tracking enabled: {_enable_tracking(sdr) or 'none'}")
+
 print("Warming up...")
 for i in range(5):
     try:
@@ -60,34 +86,59 @@ for i in range(5):
         time.sleep(0.2)
 print("Ready.\n")
 
-# ==================== Carrier offset ====================
-# Skip auto-detection, use known value from observation
-DETECTED_CARRIER_OFFSET = -200   # observed from previous runs
-# To auto-detect instead, set AUTO_DETECT = True
-AUTO_DETECT = False
+# ==================== Auto-center rx_lo on the carrier ====================
+# Pluto TCXO drifts several kHz between power-ups. Retune rx_lo onto the
+# measured carrier so it sits at 0 Hz and DETECTED_CARRIER_OFFSET stays small.
+print("Auto-centering on carrier...")
+cal_bufs = []
+for _ in range(16):
+    try:
+        cal_bufs.append(sdr.rx())
+    except Exception:
+        pass
+if cal_bufs:
+    cal = np.concatenate(cal_bufs)
+    cal_fft = np.fft.fftshift(np.fft.fft(cal * np.hanning(len(cal))))
+    cal_freqs = np.fft.fftshift(np.fft.fftfreq(len(cal), 1/SAMPLE_RATE))
+    psd = np.abs(cal_fft) ** 2
+    # Search the full capture but ignore residual LO leakage at DC.
+    search = (np.abs(cal_freqs) < WIDE_SPAN_HZ) & (np.abs(cal_freqs) > 200)
+    psd_masked = np.where(search, psd, 0)
+    peak_offset = float(cal_freqs[int(np.argmax(psd_masked))])
+    new_lo = int(CENTER_FREQ + peak_offset)
+    print(f"  Peak at {peak_offset:+.0f} Hz -> retuning rx_lo to {new_lo} Hz")
+    sdr.rx_lo = new_lo
+    for _ in range(5):
+        try:
+            sdr.rx()
+        except Exception:
+            pass
+
+# ==================== Fine carrier offset (residual, after retune) ====================
+DETECTED_CARRIER_OFFSET = 0   # after retune the carrier should be ~0 Hz
+AUTO_DETECT = True            # measure residual offset for the decoder
 
 if AUTO_DETECT:
-    print("Detecting carrier frequency...")
+    print("Measuring residual carrier offset...")
     calibration_samples = []
     for _ in range(16):
         try:
             calibration_samples.append(sdr.rx())
         except Exception:
             pass
-    
-    cal_block = np.concatenate(calibration_samples)
-    cal_windowed = cal_block * np.hanning(len(cal_block))
-    cal_fft = np.fft.fftshift(np.fft.fft(cal_windowed))
-    cal_freqs = np.fft.fftshift(np.fft.fftfreq(len(cal_block), 1/SAMPLE_RATE))
-    cal_psd = np.abs(cal_fft)**2
-    
-    # Narrower search window: ±5 kHz, and ignore DC (±50 Hz)
-    search_mask = (np.abs(cal_freqs) < 5000) & (np.abs(cal_freqs) > 50)
-    cal_psd_masked = cal_psd.copy()
-    cal_psd_masked[~search_mask] = 0
-    
-    peak_idx_global = np.argmax(cal_psd_masked)
-    DETECTED_CARRIER_OFFSET = cal_freqs[peak_idx_global]
+
+    if calibration_samples:
+        cal_block = np.concatenate(calibration_samples)
+        cal_windowed = cal_block * np.hanning(len(cal_block))
+        cal_fft = np.fft.fftshift(np.fft.fft(cal_windowed))
+        cal_freqs = np.fft.fftshift(np.fft.fftfreq(len(cal_block), 1/SAMPLE_RATE))
+        cal_psd = np.abs(cal_fft)**2
+
+        # Narrow search ±2 kHz, ignore DC (±50 Hz).
+        search_mask = (np.abs(cal_freqs) < 2000) & (np.abs(cal_freqs) > 50)
+        cal_psd_masked = cal_psd.copy()
+        cal_psd_masked[~search_mask] = 0
+        DETECTED_CARRIER_OFFSET = float(cal_freqs[int(np.argmax(cal_psd_masked))])
 
 print(f"Using carrier offset: {DETECTED_CARRIER_OFFSET:+.1f} Hz")
 print(f"Sidebands at: {DETECTED_CARRIER_OFFSET+SUBCARRIER_HZ:+.1f} Hz and {DETECTED_CARRIER_OFFSET-SUBCARRIER_HZ:+.1f} Hz\n")
