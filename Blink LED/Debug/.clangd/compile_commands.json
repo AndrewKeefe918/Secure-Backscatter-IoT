@@ -1,0 +1,7 @@
+[
+   {
+      "directory" : "C:/Users/andre/workspace_ccstheia/Blink LED/Debug",
+      "command"   : "clang++ -I\"C:/ti/ccs2050/ccs/ccs_base/msp430/include\" -I\"C:/Users/andre/workspace_ccstheia/Blink LED\" -I\"C:/ti/ccs2050/ccs/tools/compiler/ti-cgt-msp430_21.6.1.LTS/include\" -D__MSP430G2553__ -xc",
+      "file"      : "C:/Users/andre/workspace_ccstheia/Blink LED/Sidebands_Test.c"
+   }
+]
