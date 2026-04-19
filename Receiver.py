@@ -99,10 +99,12 @@ print("Ready.\n")
 # measured carrier so it sits at 0 Hz. We iterate with a progressively
 # narrower search window so a far-off spur in the ±50 kHz span cannot
 # capture the lock (previously we'd sometimes lock 33 kHz off).
+# Single-pass: ±10 kHz span, DC guard ±1500 Hz.
+# The 1500 Hz guard is intentionally wider than the 1 kHz OOK sideband so
+# the centering can never lock onto the modulation sidebands.
+# Pluto TCXO drift is at most a few kHz, so one pass is sufficient.
 CARRIER_SEARCH_PASSES = [
-    (8_000, 300),   # ±8 kHz,  ignore DC ±300 Hz
-    (2_000, 150),   # ±2 kHz,  ignore DC ±150 Hz
-    (1_000,  80),   # ±1 kHz,  ignore DC ±80 Hz (fine)
+    (10_000, 1_500),
 ]
 
 def _measure_peak_offset(sdr_, n_bufs, span_hz, dc_guard_hz):
@@ -290,10 +292,14 @@ class PacketDecoder:
         if best_peak < CORR_THRESHOLD:
             return
 
-        # Log when we cross the threshold
+        # Log when we cross the threshold; use a flag so follow-up lines
+        # (timing result, header bits) are always printed for this attempt
+        # regardless of _last_report throttling.
+        logged = False
         if self.verbose and now - self._last_report > 1.0:
             self._last_report = now
             self.attempt_count += 1
+            logged = True
             rates = " ".join(f"{e}:{v:.2f}" for e, v in per_rate)
             print(f"  [attempt {self.attempt_count}] ncc={best_peak:.2f} @ epb={best_epb} "
                   f"(span={hi-lo:.1f} dB)  rates[{rates}]  searching ±{TIMING_SEARCH} samples...")
@@ -325,8 +331,7 @@ class PacketDecoder:
                 best = (match, dt, start, bits)
 
         if best is None:
-            if self.verbose and now - self._last_report > 1.0:
-                self._last_report = now
+            if self.verbose and logged:
                 print(f"    → timing search: {rejected_noisy} windows too noisy, {len(rejected_header)} tested headers:")
                 for dt, hdr, m in rejected_header:
                     print(f"       dt={dt:+d}: 0x{hdr:04X} ({m}/16 match)")
@@ -334,8 +339,7 @@ class PacketDecoder:
         match, dt, start, bits = best
 
         if match < 15:
-            if self.verbose and now - self._last_report > 1.0:
-                self._last_report = now
+            if self.verbose and logged:
                 expected = (PREAMBLE_BYTE << 8) | SYNC_BYTE
                 got = self._header_from_bits(bits[:16])
                 print(f"    → dt={dt:+d}: got header 0x{got:04X} (bits: {' '.join(str(b) for b in bits[:16])})")
