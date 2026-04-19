@@ -178,7 +178,7 @@ def sideband_envelope(samples, fs=SAMPLE_RATE, freq=SUBCARRIER_HZ,
 # NCC threshold: 1.0 is a perfect template match, 0.0 is pure noise.
 # With slow 2 ms envelope blocks + MSP DCO jitter a clean packet scores
 # ~0.55-0.80, while background correlates at ~0.15-0.25.
-CORR_THRESHOLD = 0.40
+CORR_THRESHOLD = 0.35
 # When a peak is found, jitter the bit grid by ±TIMING_SEARCH env samples
 # to compensate for MSP clock drift over the 2.4 s packet.
 TIMING_SEARCH = 3
@@ -201,6 +201,7 @@ class PacketDecoder:
         self.last_corr = 0.0
         self.verbose = verbose
         self._last_report = 0.0
+        self.attempt_count = 0
 
     def push(self, env_db):
         self.env.extend(env_db.tolist())
@@ -289,6 +290,14 @@ class PacketDecoder:
         if best_peak < CORR_THRESHOLD:
             return
 
+        # Log when we cross the threshold
+        if self.verbose and now - self._last_report > 1.0:
+            self._last_report = now
+            self.attempt_count += 1
+            rates = " ".join(f"{e}:{v:.2f}" for e, v in per_rate)
+            print(f"  [attempt {self.attempt_count}] ncc={best_peak:.2f} @ epb={best_epb} "
+                  f"(span={hi-lo:.1f} dB)  rates[{rates}]  searching ±{TIMING_SEARCH} samples...")
+
         # 3. Fine timing search: jitter the bit grid around best_pos and
         #    keep the offset whose header matches most bits (allowing 1
         #    bit-error in the 16-bit header).
@@ -312,16 +321,20 @@ class PacketDecoder:
                 best = (match, dt, start, bits)
 
         if best is None:
+            if self.verbose and now - self._last_report > 1.0:
+                self._last_report = now
+                print(f"    → timing search failed: no valid window (all too noisy or out of bounds)")
             return
         match, dt, start, bits = best
 
         if match < 15:
-            if self.verbose and now - self._last_report > 1.5:
+            if self.verbose and now - self._last_report > 1.0:
                 self._last_report = now
                 expected = (PREAMBLE_BYTE << 8) | SYNC_BYTE
                 got = self._header_from_bits(bits[:16])
-                print(f"  header mismatch: got 0x{got:04X} want 0x{expected:04X} "
-                      f"(ncc={best_peak:.2f}, epb={epb}, dt={dt}, match={match}/16)")
+                print(f"    → dt={dt:+d}: got header 0x{got:04X} (bits: {' '.join(str(b) for b in bits[:16])})")
+                print(f"       want        0x{expected:04X} (bits: {' '.join(str(int((expected >> (15-i)) & 1)) for i in range(16))})")
+                print(f"       match: {match}/16 Hamming distance")
             return
 
         # 4. Pack payload MSB-first.
@@ -339,12 +352,16 @@ class PacketDecoder:
             self.last_decoded = message
             self.last_packet_time = now
             bit_ms = epb * ENV_WINDOW_MS
-            print(f"\n{'='*60}")
-            print(f"  PACKET #{self.packet_count}: \"{message}\"  "
-                  f"raw={['0x%02X' % v for v in raw]}")
-            print(f"    ncc={best_peak:.2f}  bit={bit_ms} ms  dt={dt}  "
-                  f"header={match}/16")
-            print(f"{'='*60}\n")
+            # Format payload bits for display
+            payload_bits = " ".join(str(int(bits[16 + i])) for i in range(32))
+            print(f"\n{'='*70}")
+            print(f"✓ PACKET #{self.packet_count} DECODED")
+            print(f"  Message: \"{message}\"")
+            print(f"  Bytes: {' '.join('0x%02X' % v for v in raw)}")
+            print(f"  Bits:  {payload_bits}")
+            print(f"  NCC: {best_peak:.3f}  Bit period: {bit_ms} ms  Timing shift: {dt:+d}  "
+                  f"Header match: {match}/16")
+            print(f"{'='*70}\n")
 
         # Drop the consumed envelope so we don't re-decode the same packet.
         consume = start + packet_len
@@ -385,6 +402,7 @@ start_time = time.time()
 
 print(f"Receiver running. Looking for 'OPEN' packets...")
 print(f"Detection frequencies: {-SUBCARRIER_HZ:+.0f} Hz and {+SUBCARRIER_HZ:+.0f} Hz")
+print(f"Decode thresholds: NCC ≥ {CORR_THRESHOLD:.2f}, bit period ±{TIMING_SEARCH} env samples")
 print("Ctrl+C to stop.\n")
 
 frame = 0
