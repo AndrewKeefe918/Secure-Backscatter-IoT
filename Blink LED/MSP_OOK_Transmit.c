@@ -13,12 +13,13 @@
  *   '1' bit: 1 kHz subcarrier ON  (sidebands present)
  *   '0' bit: 1 kHz subcarrier OFF (no sidebands)
  * 
- * Timing: 50 ms per bit
+ * Timing: 50 subcarrier periods per bit (nominally 50 ms at 1 kHz)
  */
 
-#define BIT_DURATION_MS         50
 #define PACKET_LENGTH           6
-#define GAP_BETWEEN_PACKETS_MS  2000
+#define SUBCARRIER_HZ_NOMINAL        1000U
+#define BIT_SUBCARRIER_PERIODS       50U
+#define GAP_BETWEEN_PACKETS_PERIODS  2000U
 
 const uint8_t packet[PACKET_LENGTH] = {
     0xAA,
@@ -29,11 +30,17 @@ const uint8_t packet[PACKET_LENGTH] = {
     'N'
 };
 
-static void delay_ms(uint16_t ms) {
-    while (ms--) {
-        __delay_cycles(1000);
+/* Wait for N subcarrier timer periods using CCR0 flag events.
+ * This keeps OOK bit timing locked to the same timer that generates
+ * the subcarrier, avoiding software delay drift and clock mismatch. */
+static void wait_subcarrier_periods(uint16_t periods) {
+    while (periods--) {
+        while ((TA0CCTL0 & CCIFG) == 0) {
+            /* spin */
+        }
+        TA0CCTL0 &= ~CCIFG;
     }
-} /* end delay_ms */
+} /* end wait_subcarrier_periods */
 
 /* Route the free-running 1 kHz timer output onto P1.1.
  *
@@ -63,7 +70,7 @@ void transmit_byte(uint8_t byte) {
         } else {
             subcarrier_off();
         } /* end if */
-        delay_ms(BIT_DURATION_MS);
+        wait_subcarrier_periods(BIT_SUBCARRIER_PERIODS);
     } /* end for */
 } /* end transmit_byte */
 
@@ -92,15 +99,19 @@ int main(void) {
     P1SEL2 &= ~BIT1;
 
     /* Timer_A0: SMCLK (1 MHz), up mode, toggle on CCR0.
-     * CCR0 = 499 -> toggle every 500 us -> 1 kHz square wave.
+     * CCR0 = (SMCLK / (2*SUBCARRIER_HZ_NOMINAL)) - 1.
+     * With SMCLK=1 MHz and SUBCARRIER_HZ_NOMINAL=1 kHz: CCR0=499.
      * Start it ONCE and leave it running forever. */
-    TA0CCR0  = 499;
+    TA0CCR0  = (1000000U / (2U * SUBCARRIER_HZ_NOMINAL)) - 1U;
     TA0CCTL0 = OUTMOD_4;
     TA0CTL   = TASSEL_2 | MC_1 | TACLR;
 
+    /* Clear any stale CCR0 event before timing bits from CCIFG edges. */
+    TA0CCTL0 &= ~CCIFG;
+
     while (1) {
         transmit_packet();
-        delay_ms(GAP_BETWEEN_PACKETS_MS);
+        wait_subcarrier_periods(GAP_BETWEEN_PACKETS_PERIODS);
     } /* end while */
 
     return 0;
