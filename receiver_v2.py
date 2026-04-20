@@ -23,35 +23,26 @@ BUFFER_SIZE = 4096
 RX_GAIN = 50
 
 WIDE_SPAN_HZ = 50_000
-ZOOM_SPAN_HZ = 12_000
+ZOOM_SPAN_HZ = 5_000
 CARRIER_COARSE_SEARCH_HZ = 12_000
 CARRIER_FINE_SEARCH_HZ = 1_500
 
 # Must match the MSP firmware subcarrier (Timer_A CCR0 toggle rate).
-# Observed on the air: 1 kHz fundamental + 2/3 kHz harmonics.
+# Confirmed: unplug MSP -> 1 kHz sidebands disappear; plug in -> sidebands
+# return. MSP is running at the intended 1 kHz.
 SUBCARRIER_HZ = 1000
-# When True, skip the auto-scan and lock to SUBCARRIER_HZ. Set False to
-# let the receiver pick the strongest harmonic on startup.
+# Force the decoder to lock to SUBCARRIER_HZ instead of picking the
+# strongest bin in scan_sidebands().
 FORCE_SUBCARRIER = True
-NOISE_REF_DELTA_HZ = 400          # inside the gaps between harmonics
+NOISE_REF_DELTA_HZ = 400          # inside the gaps between 1 kHz harmonics
 BASELINE_FREQ_HZ = 12_000         # out-of-band common-mode reference
-# Bit time scales with the subcarrier: MSP is running ~2x fast, so the
-# real bit period is ~25 ms. Search a wide range so we can lock it.
+# Nominal bit period: 50 ms (20 bps).
 BIT_DURATION_MS = 50
-BIT_DURATION_MIN_MS = 40
-BIT_DURATION_MAX_MS = 60
+BIT_DURATION_MIN_MS = 20
+BIT_DURATION_MAX_MS = 80
 ENV_WINDOW_MS = 5
 ENV_SAMPLES = SAMPLE_RATE * ENV_WINDOW_MS // 1000
 ENV_PER_BIT = BIT_DURATION_MS // ENV_WINDOW_MS
-# When True, skip the bit-period search and lock epb to ENV_PER_BIT
-# (i.e. trust BIT_DURATION_MS). The MSP G2553 derives its bit timing
-# from the same SMCLK/Timer_A0 as the subcarrier (CCR0=499, 100 ticks
-# per bit -> nominal 50 ms), but the DCO has +/-1 % tolerance and
-# temperature drift. Even a single 5 ms epb slip across a 48-bit
-# packet wrecks the matched filter, so we let the search lock to the
-# actual MSP bit period. Candidate range below is tight around 50 ms.
-FORCE_EPB = False
-_ENV_DUMP_DONE = False
 
 PREAMBLE_BYTE = 0xAA
 SYNC_BYTE = 0x7E
@@ -66,13 +57,18 @@ ACTIVITY_MIN_SPAN_DB = 5.0        # reject ambient WiFi / BT modulation
 WINDOW_MIN_SPAN_DB = 3.0
 PAYLOAD_MIN_MATCH = 20
 PACKET_MIN_MATCH = 32
-SYNC_MIN_MATCH = 10   # out of 16 preamble+sync bits
+SYNC_MIN_MATCH = 11   # out of 16 preamble+sync bits
 
 _min_epb = max(1, int(round(BIT_DURATION_MIN_MS / ENV_WINDOW_MS)))
 _max_epb = max(_min_epb, int(round(BIT_DURATION_MAX_MS / ENV_WINDOW_MS)))
 BIT_PERIOD_CANDIDATES = tuple(range(_min_epb, _max_epb + 1))
-if FORCE_EPB:
-    BIT_PERIOD_CANDIDATES = (ENV_PER_BIT,)
+
+# Bandpass filter around the carrier applied to the raw IQ stream before
+# both the display FFT and the sideband envelope extraction. Keeps
+# [carrier - BANDPASS_HW_HZ, carrier + BANDPASS_HW_HZ] and zeros the
+# rest in the frequency domain. Wide enough to pass the 1 kHz
+# subcarrier + its 3 kHz harmonic plus some guard.
+BANDPASS_HW_HZ = 1_500
 
 _sync_bits = np.array(
     [(PREAMBLE_BYTE >> (7 - i)) & 1 for i in range(8)] +
@@ -128,7 +124,7 @@ def drain(sdr, n=4):
 
 
 def scan_sidebands(sdr, carrier_offset, n_bufs=32,
-                   freqs_hz=(1000, 2000, 3000),
+                   freqs_hz=(500, 1000, 2000, 3000),
                    noise_delta=NOISE_REF_DELTA_HZ):
     """
     One-shot sideband scan: for each candidate f, measure pair power at
@@ -200,17 +196,26 @@ def locate_carrier(sdr, n_bufs=32, search_hz=CARRIER_COARSE_SEARCH_HZ):
 
 
 # ==================== Sideband envelope ====================
+def bandpass_iq(samples, carrier_offset, hw_hz=BANDPASS_HW_HZ):
+    """FFT-domain bandpass: keep [carrier_offset +/- hw_hz], zero rest.
+
+    Wide enough to preserve the carrier + first few subcarrier harmonics
+    but narrow enough to reject WiFi / BT ambient and out-of-band noise.
+    """
+    N = len(samples)
+    if N == 0:
+        return samples
+    spec = np.fft.fft(samples)
+    fqs = np.fft.fftfreq(N, 1 / SAMPLE_RATE)
+    mask = np.abs(fqs - carrier_offset) <= hw_hz
+    spec[~mask] = 0
+    return np.fft.ifft(spec).astype(samples.dtype)
+
+
 def sideband_envelope(samples, carrier_offset, freq=SUBCARRIER_HZ,
                       win=ENV_SAMPLES, noise_delta=NOISE_REF_DELTA_HZ,
                       baseline_freq=BASELINE_FREQ_HZ):
     """Per-window sideband-to-noise ratio in dB.
-
-    The MSP subcarrier is a SQUARE wave (Timer_A0 OUTMOD_4 toggle), so
-    its energy splits across odd harmonics: 1k, 3k, 5k... The
-    fundamental carries ~ (8/pi^2) ~ 81 % of the power and the 3rd
-    harmonic ~ 9 %, but on a quiet band adding the 3rd harmonic gives
-    a real +0.4 dB and helps the matched filter when the fundamental
-    bin happens to sit on a noise spike. We sum |sig|^2 at f and 3f.
 
     A far-off-band bin at +/- baseline_freq is subtracted as a
     common-mode reference: ambient 2.4 GHz traffic (WiFi/BT) hits all
@@ -226,9 +231,7 @@ def sideband_envelope(samples, carrier_offset, freq=SUBCARRIER_HZ,
     def pwr(f):
         return np.abs(x @ np.exp(-2j * np.pi * f * t) / win) ** 2
 
-    # Fundamental + 3rd harmonic (square-wave OOK subcarrier).
-    sig = (pwr(carrier_offset + freq)     + pwr(carrier_offset - freq)
-         + pwr(carrier_offset + 3 * freq) + pwr(carrier_offset - 3 * freq))
+    sig = pwr(carrier_offset + freq) + pwr(carrier_offset - freq)
     refs = np.stack((
         pwr(carrier_offset + freq - noise_delta),
         pwr(carrier_offset + freq + noise_delta),
@@ -395,23 +398,6 @@ class PacketDecoder:
             print(f"[full ] got={full_got}")
             print(f"[full ] exp={full_exp}")
             print(f"[full ] dif={diff}  ({np.sum(bits == _expected_packet_bits)}/48)")
-            # One-shot envelope dump for offline analysis.
-            global _ENV_DUMP_DONE
-            if not _ENV_DUMP_DONE:
-                pre_pad = 4 * epb
-                post_pad = 4 * epb
-                a = max(0, start - pre_pad)
-                b = min(len(env), start + packet_len + post_pad)
-                np.savez("envelope_dump.npz",
-                         env=env[a:b].astype(np.float32),
-                         start_idx=start - a,
-                         epb=epb,
-                         env_window_ms=ENV_WINDOW_MS,
-                         expected_bits=_expected_packet_bits,
-                         got_bits=bits)
-                print(f"[dump ] wrote envelope_dump.npz  "
-                      f"({b-a} samples, start={start-a}, epb={epb})")
-                _ENV_DUMP_DONE = True
         if sync_match < SYNC_MIN_MATCH:
             return
         if payload_match < PAYLOAD_MIN_MATCH:
@@ -452,11 +438,11 @@ def main():
     carrier_offset = locate_carrier(sdr, n_bufs=16, search_hz=CARRIER_FINE_SEARCH_HZ)
     print(f"Carrier at {carrier_offset:+.1f} Hz\n")
 
+    subcarrier_hz = scan_sidebands(sdr, carrier_offset)
     if FORCE_SUBCARRIER:
+        if subcarrier_hz != SUBCARRIER_HZ:
+            print(f"[force] overriding scan pick {subcarrier_hz} Hz -> {SUBCARRIER_HZ} Hz")
         subcarrier_hz = SUBCARRIER_HZ
-        print(f"Subcarrier locked to {subcarrier_hz} Hz (FORCE_SUBCARRIER=True)\n")
-    else:
-        subcarrier_hz = scan_sidebands(sdr, carrier_offset)
     print(f"Sidebands at {carrier_offset + subcarrier_hz:+.0f} Hz and "
           f"{carrier_offset - subcarrier_hz:+.0f} Hz\n")
 
@@ -465,7 +451,7 @@ def main():
     freqs = np.fft.fftshift(np.fft.fftfreq(accum_len, 1 / SAMPLE_RATE))
     zoom_mask = (freqs >= -ZOOM_SPAN_HZ) & (freqs <= ZOOM_SPAN_HZ)
     freqs_zoom = freqs[zoom_mask]
-    fft_win = np.hanning(accum_len)
+    fft_win = np.blackman(accum_len)
     fft_gain = float(np.sum(fft_win ** 2))
 
     plt.ion()
@@ -496,6 +482,12 @@ def main():
     PLOT_EVERY = 4
     frame = 0
     last_bitdur_print = 0.0
+    # Carrier re-lock: if the peak in the zoom window stays below
+    # CARRIER_RELOCK_MIN_DISP_DB (display units, where 0 dB disp == 60 dB true)
+    # for CARRIER_RELOCK_HOLD_SEC seconds, re-run locate_carrier and retune rx_lo.
+    CARRIER_RELOCK_MIN_DISP_DB = 30.0
+    CARRIER_RELOCK_HOLD_SEC    = 2.0
+    carrier_low_since = None
     try:
         while True:
             bufs = []
@@ -505,6 +497,7 @@ def main():
             if len(bufs) < n_bufs_per_frame:
                 continue
             samples = np.concatenate(bufs)
+            samples = bandpass_iq(samples, carrier_offset)
 
             env_db = median_filter_1d(sideband_envelope(samples, carrier_offset, freq=subcarrier_hz))
             decoder.push(env_db)
@@ -528,11 +521,12 @@ def main():
                     if len(e) == 0:
                         return 0.0, 0.0
                     return float(np.mean(e)), float(np.percentile(e, 90) - np.percentile(e, 10))
-                probes = (1000, 2000, 3000)
+                probes = (500, 1000, 2000, 3000)
                 parts = []
                 for pf in probes:
                     mean_db, span_db = _bin_stats(pf)
-                    parts.append(f"{pf//1000:>2d}k:{mean_db:+5.1f}/{span_db:4.1f}")
+                    label = f"{pf:>4d}" if pf < 1000 else f"{pf//1000:>3d}k"
+                    parts.append(f"{label}:{mean_db:+5.1f}/{span_db:4.1f}")
                 print(f"[bins ] " + "  ".join(parts) + "   (mean/span dB)")
                 print(f"[decode] best ncc={decoder.last_corr:.3f}  "
                       f"epb={decoder.last_epb} "
@@ -563,17 +557,45 @@ def main():
             psd_db   = 10 * np.log10(psd_avg + 1e-20)
             psd_zoom = psd_db[zoom_mask]
             peak_power = float(np.max(psd_zoom))
+            # Shift display so plotted "0 dB" corresponds to a true reading of 60 dB.
+            DISPLAY_REF_DB = 60.0
+            psd_zoom_disp  = psd_zoom - DISPLAY_REF_DB
+            peak_disp      = peak_power - DISPLAY_REF_DB
+
+            # Carrier re-lock: if peak in the zoom window stays below the
+            # threshold for >= hold time, retune rx_lo to the new peak.
+            if peak_disp < CARRIER_RELOCK_MIN_DISP_DB:
+                if carrier_low_since is None:
+                    carrier_low_since = time.time()
+                elif time.time() - carrier_low_since >= CARRIER_RELOCK_HOLD_SEC:
+                    print(f"[relock] carrier below {CARRIER_RELOCK_MIN_DISP_DB:.0f} dB disp "
+                          f"for {CARRIER_RELOCK_HOLD_SEC:.1f}s (peak={peak_disp:+.1f} dB disp). "
+                          f"Re-locating...")
+                    new_off = locate_carrier(sdr, n_bufs=16, search_hz=CARRIER_FINE_SEARCH_HZ)
+                    sdr.rx_lo = int(sdr.rx_lo + new_off)
+                    drain(sdr)
+                    carrier_offset = locate_carrier(sdr, n_bufs=8, search_hz=CARRIER_FINE_SEARCH_HZ)
+                    psd_avg = None  # reset averaged spectrum
+                    carrier_low_since = None
+                    print(f"[relock] new carrier offset {carrier_offset:+.1f} Hz")
+                    continue
+            else:
+                carrier_low_since = None
 
             ax_zoom.clear()
-            ax_zoom.plot(freqs_zoom, psd_zoom, lw=0.8, color="steelblue")
+            ax_zoom.plot(freqs_zoom, psd_zoom_disp, lw=0.8, color="steelblue")
             ax_zoom.axvline(carrier_offset, color="green", ls="--", alpha=0.5, label="Carrier")
             ax_zoom.axvline(carrier_offset + subcarrier_hz, color="red", ls="--", alpha=0.6,
                             label=f"+/-{subcarrier_hz} Hz sideband")
             ax_zoom.axvline(carrier_offset - subcarrier_hz, color="red", ls="--", alpha=0.6)
             ax_zoom.set_xlabel("Offset from carrier (Hz)")
-            ax_zoom.set_ylabel("Power (dB)")
-            ax_zoom.set_title(f"Zoomed View | Carrier {peak_power:.1f} dB")
+            ax_zoom.set_ylabel(f"Power (dB, 0 = {DISPLAY_REF_DB:.0f} dB true)")
+            ax_zoom.set_title(f"Zoomed View | Carrier {peak_power:.1f} dB true ({peak_disp:+.1f} dB disp)")
             ax_zoom.set_xlim(-ZOOM_SPAN_HZ, ZOOM_SPAN_HZ)
+            # Fixed y-axis (display frame): show ~70 dB below carrier peak so the
+            # sidebands (~40-50 dB below carrier) are always visible and
+            # don't get rescaled every frame.
+            ax_zoom.set_ylim(peak_disp - 70, peak_disp + 5)
             ax_zoom.grid(True, alpha=0.3)
             ax_zoom.legend(loc="upper right", fontsize=8)
 

@@ -648,3 +648,51 @@ Sun Apr 19 21:40:19 2026:	* ----------------------------------------------------
 Sun Apr 19 21:40:19 2026:	* Driver      : closed (No error)
 Sun Apr 19 21:40:19 2026:	* ----------------------------------------------------------------------------
 Sun Apr 19 21:40:19 2026:	*/
+Sun Apr 19 22:11:44 2026:	* -----/|-------------------------------------------------------------------- *
+Sun Apr 19 22:11:44 2026:	*     / |__                                                                   *
+Sun Apr 19 22:11:44 2026:	*    /_   /   MSP Flasher v1.3.20                                             *
+Sun Apr 19 22:11:44 2026:	*      | /                                                                    *
+Sun Apr 19 22:11:44 2026:	* -----|/-------------------------------------------------------------------- *
+Sun Apr 19 22:11:44 2026:	*
+Sun Apr 19 22:11:44 2026:	* Evaluating triggers...done
+Sun Apr 19 22:11:44 2026:	* Checking for available FET debuggers: 
+Sun Apr 19 22:11:44 2026:	* Found USB FET @ COM4 <- Selected
+Sun Apr 19 22:11:44 2026:	* Initializing interface @ COM4...done
+Sun Apr 19 22:11:44 2026:	* Checking firmware compatibility: 
+Sun Apr 19 22:11:44 2026:	* FET firmware is up to date.
+Sun Apr 19 22:11:44 2026:	* Reading FW version...done
+Sun Apr 19 22:11:44 2026:	* Setting VCC to 3000 mV...done
+Sun Apr 19 22:11:47 2026:	* Accessing device...done
+Sun Apr 19 22:11:47 2026:	* Reading device information...
+Sun Apr 19 22:11:47 2026:	* Warning: Found device does not match -n selection:
+Sun Apr 19 22:11:47 2026:	- Selected: MSP430G2553
+Sun Apr 19 22:11:47 2026:	- Found:    MSP430G2xx3
+Sun Apr 19 22:11:47 2026:	- Continue? (Y/N): Sun Apr 19 22:12:01 2026:	y
+Sun Apr 19 22:12:01 2026:	* Loading file into device...done
+Sun Apr 19 22:12:03 2026:	* Verifying memory (C:\Users\andre\GitHub\Secure-Backscatter-IoT\Blink LED\Debug\Blink LED.txt)...done
+Sun Apr 19 22:12:04 2026:	* 
+Sun Apr 19 22:12:04 2026:	* ----------------------------------------------------------------------------
+Sun Apr 19 22:12:04 2026:	* Arguments   : -n MSP430G2553 -w C:\Users\andre\GitHub\Secure-Backscatter-IoT\Blink LED\Debug\Blink LED.txt -v -z [VCC] 
+Sun Apr 19 22:12:04 2026:	* ----------------------------------------------------------------------------
+Sun Apr 19 22:12:04 2026:	* Driver      : loaded
+Sun Apr 19 22:12:04 2026:	* Dll Version : 31400000
+Sun Apr 19 22:12:04 2026:	* FwVersion   : 31200000
+Sun Apr 19 22:12:04 2026:	* Interface   : TIUSB
+Sun Apr 19 22:12:04 2026:	* HwVersion   : E 6.0
+Sun Apr 19 22:12:04 2026:	* JTAG Mode   : AUTO
+Sun Apr 19 22:12:04 2026:	* Device      : MSP430G2xx3
+Sun Apr 19 22:12:04 2026:	* EEM         : Level 1, ClockCntrl 1
+Sun Apr 19 22:12:04 2026:	* Erase Mode  : ERASE_ALL
+Sun Apr 19 22:12:04 2026:	* Prog.File   : C:\Users\andre\GitHub\Secure-Backscatter-IoT\Blink LED\Debug\Blink LED.txt
+Sun Apr 19 22:12:04 2026:	* Verified    : TRUE
+Sun Apr 19 22:12:04 2026:	* BSL Unlock  : FALSE
+Sun Apr 19 22:12:04 2026:	* InfoA Access: FALSE
+Sun Apr 19 22:12:04 2026:	* VCC ON      : 3000 mV
+Sun Apr 19 22:12:04 2026:	* ----------------------------------------------------------------------------
+Sun Apr 19 22:12:04 2026:	* Starting target code execution...done
+Sun Apr 19 22:12:05 2026:	* Disconnecting from device...done
+Sun Apr 19 22:12:05 2026:	* 
+Sun Apr 19 22:12:05 2026:	* ----------------------------------------------------------------------------
+Sun Apr 19 22:12:05 2026:	* Driver      : closed (No error)
+Sun Apr 19 22:12:05 2026:	* ----------------------------------------------------------------------------
+Sun Apr 19 22:12:05 2026:	*/
