@@ -4,7 +4,9 @@
 /*
  * Secure Backscatter Transmitter (MSP430G2553).
  *
- * Packet:    0xAA 0x7E 'O' 'P' 'E' 'N'   (48 bits, MSB first).
+ * Packet:    0xAA 0x7E 0x55 0x55 0x55 0x55   (48 bits, MSB first).
+ *            Test pattern: alternating bits in payload so any corruption
+ *            (stuck-high / stuck-low / wrong-stride) is obvious on the air.
  * Encoding:  OOK of a 1 kHz subcarrier. '1' = subcarrier on, '0' = off.
  * Bit time:  50 ms (100 CCR0 toggle events at 500 us each).
  *
@@ -18,7 +20,7 @@
 #define BIT_SUBCARRIER_TICKS        100U    /* 100 * 500us = 50 ms */
 #define GAP_BETWEEN_PACKETS_TICKS   4000U   /* 2 s */
 
-const uint8_t packet[PACKET_LENGTH] = { 0xAA, 0x7E, 'O', 'P', 'E', 'N' };
+const uint8_t packet[PACKET_LENGTH] = { 0xAA, 0x7E, 0x55, 0x55, 0x55, 0x55 };
 
 /* Block for N CCR0 toggle events. Locks bit timing to the subcarrier
  * timer so there is no software-delay drift. */
