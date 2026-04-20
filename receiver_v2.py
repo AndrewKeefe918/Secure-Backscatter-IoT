@@ -28,10 +28,14 @@ CARRIER_COARSE_SEARCH_HZ = 12_000
 CARRIER_FINE_SEARCH_HZ = 1_500
 
 # Must match the MSP firmware subcarrier (Timer_A CCR0 toggle rate).
-SUBCARRIER_HZ = 1000
-NOISE_REF_DELTA_HZ = 350
-BIT_DURATION_MS = 50
-BIT_DURATION_MIN_MS = 40
+# Observed on the air: 2 kHz fundamental + 4/6/8/10 kHz harmonics.
+SUBCARRIER_HZ = 2000
+NOISE_REF_DELTA_HZ = 600          # further off to avoid WiFi skirts
+BASELINE_FREQ_HZ = 12_000         # out-of-band common-mode reference
+# Bit time scales with the subcarrier: MSP is running ~2x fast, so the
+# real bit period is ~25 ms. Search a wide range so we can lock it.
+BIT_DURATION_MS = 25
+BIT_DURATION_MIN_MS = 15
 BIT_DURATION_MAX_MS = 60
 ENV_WINDOW_MS = 5
 ENV_SAMPLES = SAMPLE_RATE * ENV_WINDOW_MS // 1000
@@ -46,11 +50,11 @@ PACKET_BITS = 8 * (2 + PAYLOAD_BYTES)
 CORR_THRESHOLD = 0.32
 TIMING_SEARCH = 3
 BIT_AVG_FRAC = 0.6
-ACTIVITY_MIN_SPAN_DB = 2.5
-WINDOW_MIN_SPAN_DB = 1.0
-PAYLOAD_MIN_MATCH = 24
-PACKET_MIN_MATCH = 38
-SYNC_MIN_MATCH = 14   # out of 16 preamble+sync bits
+ACTIVITY_MIN_SPAN_DB = 5.0        # reject ambient WiFi / BT modulation
+WINDOW_MIN_SPAN_DB = 3.0
+PAYLOAD_MIN_MATCH = 20
+PACKET_MIN_MATCH = 32
+SYNC_MIN_MATCH = 11   # out of 16 preamble+sync bits
 
 _min_epb = max(1, int(round(BIT_DURATION_MIN_MS / ENV_WINDOW_MS)))
 _max_epb = max(_min_epb, int(round(BIT_DURATION_MAX_MS / ENV_WINDOW_MS)))
@@ -110,7 +114,7 @@ def drain(sdr, n=4):
 
 
 def scan_sidebands(sdr, carrier_offset, n_bufs=32,
-                   freqs_hz=(1000, 3000, 5000, 7000),
+                   freqs_hz=(1000, 2000, 3000, 4000, 5000, 6000, 7000),
                    noise_delta=NOISE_REF_DELTA_HZ):
     """
     One-shot sideband scan: for each candidate f, measure pair power at
@@ -140,13 +144,18 @@ def scan_sidebands(sdr, carrier_offset, n_bufs=32,
         snr = 10 * np.log10((sig + 1e-20) / (n + 1e-20))
         env = sideband_envelope(block, carrier_offset, freq=f)
         span = float(np.percentile(env, 85) - np.percentile(env, 15)) if len(env) else 0.0
-        # Favor frequencies that are both spectrally strong and OOK-active.
-        score = snr + 2.0 * max(0.0, span - 1.0)
+        # Score emphasizes OOK activity; env is already baseline-subtracted.
+        score = snr + 3.0 * max(0.0, span - ACTIVITY_MIN_SPAN_DB)
         if score > best_score:
             best_score, best_f = score, f
         print(f"  {f:>5} Hz:  snr={snr:+6.1f} dB  env-span={span:4.2f} dB  score={score:6.2f}")
-    print(f"  -> using {best_f} Hz  (score {best_score:.2f})\n")
-    return int(best_f) if best_f is not None else SUBCARRIER_HZ
+    if best_f is None:
+        best_f = SUBCARRIER_HZ
+    print(f"  -> using {best_f} Hz  (score {best_score:.2f})")
+    if best_score < ACTIVITY_MIN_SPAN_DB:
+        print(f"  [warn] no OOK activity detected - is the MSP transmitting?")
+    print()
+    return int(best_f)
 
 
 def locate_carrier(sdr, n_bufs=32, search_hz=CARRIER_COARSE_SEARCH_HZ):
@@ -178,8 +187,15 @@ def locate_carrier(sdr, n_bufs=32, search_hz=CARRIER_COARSE_SEARCH_HZ):
 
 # ==================== Sideband envelope ====================
 def sideband_envelope(samples, carrier_offset, freq=SUBCARRIER_HZ,
-                      win=ENV_SAMPLES, noise_delta=NOISE_REF_DELTA_HZ):
-    """Per-window sideband-to-noise ratio in dB."""
+                      win=ENV_SAMPLES, noise_delta=NOISE_REF_DELTA_HZ,
+                      baseline_freq=BASELINE_FREQ_HZ):
+    """Per-window sideband-to-noise ratio in dB.
+
+    A far-off-band bin at +/- baseline_freq is subtracted as a
+    common-mode reference: ambient 2.4 GHz traffic (WiFi/BT) hits all
+    bins together, so subtracting the out-of-band level suppresses
+    non-MSP modulation that the noise-delta bins can't reject alone.
+    """
     n = (len(samples) // win) * win
     if n == 0:
         return np.empty(0, dtype=np.float32)
@@ -197,7 +213,11 @@ def sideband_envelope(samples, carrier_offset, freq=SUBCARRIER_HZ,
         pwr(carrier_offset - freq - noise_delta),
     ), axis=1)
     noise = np.mean(np.sort(refs, axis=1)[:, :3], axis=1)
-    return (10 * np.log10((sig + 1e-20) / (noise + 1e-20))).astype(np.float32)
+    baseline = 0.5 * (pwr(carrier_offset + baseline_freq)
+                    + pwr(carrier_offset - baseline_freq))
+    # Take the larger of local-noise and out-of-band baseline.
+    denom = np.maximum(noise, baseline)
+    return (10 * np.log10((sig + 1e-20) / (denom + 1e-20))).astype(np.float32)
 
 
 def estimate_bit_duration_ms(env_db, min_span_db=ACTIVITY_MIN_SPAN_DB):
@@ -249,6 +269,7 @@ class PacketDecoder:
         self.env = deque(maxlen=int(buffer_seconds * 1000 / ENV_WINDOW_MS))
         self.last_decoded = ""
         self.last_corr = 0.0
+        self.last_epb = ENV_PER_BIT
         self.last_packet_time = 0.0
         self.packet_count = 0
 
@@ -300,6 +321,7 @@ class PacketDecoder:
             if val > best_peak:
                 best_peak, best_epb, best_pos = val, epb, pos
         self.last_corr = best_peak
+        self.last_epb = best_epb
         if best_peak < CORR_THRESHOLD:
             return
 
@@ -325,22 +347,39 @@ class PacketDecoder:
         if best is None:
             return
         sync_match, dt, start, bits = best
-        # Hard gate: preamble+sync must be nearly perfect.
-        if sync_match < SYNC_MIN_MATCH:
-            return
+        # Debug: always log sampled header when correlation passes the gate,
+        # so we can see exactly what bit pattern is at the locked position.
+        hdr_bits = "".join(str(int(b)) for b in bits[:16])
+        exp_bits = "".join(str(int(b)) for b in sync_bits_expected)
         payload_match = int(np.sum(bits[16:] == _expected_packet_bits[16:]))
-        if payload_match < PAYLOAD_MIN_MATCH:
-            return
-        pkt_match = sync_match + payload_match
-
-        raw = []
-        message = ""
+        # Decode whatever bytes we've got now so we can see how close we are.
+        raw_now = []
         for bi in range(PAYLOAD_BYTES):
             v = 0
             for j in range(8):
                 v = (v << 1) | int(bits[16 + bi * 8 + j])
-            raw.append(v)
-            message += chr(v) if 32 <= v < 127 else "?"
+            raw_now.append(v)
+        msg_now = "".join(chr(v) if 32 <= v < 127 else "?" for v in raw_now)
+        print(f"[hdr  ] got={hdr_bits}  exp={exp_bits}  "
+              f"sync={sync_match}/16  pay={payload_match}/32  "
+              f"epb={epb}  dt={dt:+d}  msg=\"{msg_now}\"")
+        # Print all 48 received bits vs expected when sync is clean, so
+        # we can see exactly which payload bits diverge.
+        if sync_match >= SYNC_MIN_MATCH:
+            full_got = "".join(str(int(b)) for b in bits)
+            full_exp = "".join(str(int(b)) for b in _expected_packet_bits)
+            diff = "".join(" " if g == e else "^" for g, e in zip(full_got, full_exp))
+            print(f"[full ] got={full_got}")
+            print(f"[full ] exp={full_exp}")
+            print(f"[full ] dif={diff}  ({np.sum(bits == _expected_packet_bits)}/48)")
+        if sync_match < SYNC_MIN_MATCH:
+            return
+        if payload_match < PAYLOAD_MIN_MATCH:
+            return
+        pkt_match = sync_match + payload_match
+
+        raw = raw_now
+        message = msg_now
 
         now = time.time()
         if now - self.last_packet_time > 0.5:
@@ -436,6 +475,26 @@ def main():
             if now_rel - last_bitdur_print >= 1.0 and len(env_plot) >= 100:
                 est = estimate_bit_duration_ms(np.asarray(env_plot, dtype=np.float32))
                 last_bitdur_print = now_rel
+
+                # Bin-level diagnostic: show mean and peak-to-trough span of the
+                # sideband envelope at each tracked frequency. A real OOK signal
+                # should show a large (>5 dB) span at its subcarrier frequency.
+                def _bin_stats(f_hz):
+                    e = sideband_envelope(samples, carrier_offset, freq=f_hz)
+                    if len(e) == 0:
+                        return 0.0, 0.0
+                    return float(np.mean(e)), float(np.percentile(e, 90) - np.percentile(e, 10))
+                probes = (1000, 2000, 3000, 4000, 5000, 6000, 7000)
+                parts = []
+                for pf in probes:
+                    mean_db, span_db = _bin_stats(pf)
+                    parts.append(f"{pf//1000:>2d}k:{mean_db:+5.1f}/{span_db:4.1f}")
+                print(f"[bins ] " + "  ".join(parts) + "   (mean/span dB)")
+                print(f"[decode] best ncc={decoder.last_corr:.3f}  "
+                      f"epb={decoder.last_epb} "
+                      f"({decoder.last_epb*ENV_WINDOW_MS}ms)  "
+                      f"threshold={CORR_THRESHOLD:.2f}")
+
                 if est is None:
                     print(f"[bit-dur] no activity (envelope span < "
                           f"{ACTIVITY_MIN_SPAN_DB:.1f} dB)")
