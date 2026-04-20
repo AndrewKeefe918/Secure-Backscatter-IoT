@@ -61,15 +61,25 @@ static void transmit_packet(void) {
 int main(void) {
     WDTCTL = WDTPW | WDTHOLD;
 
-    /* Load 1 MHz DCO calibration. If CAL bytes are erased, blink slowly
-     * instead of transmitting at an unknown clock rate. */
-    if (CALBC1_1MHZ == 0xFF || CALDCO_1MHZ == 0xFF) {
-        P1DIR |= BIT0;
-        while (1) { P1OUT ^= BIT0; __delay_cycles(100000); }
+    /* Load 1 MHz DCO calibration via explicit pointer dereference so the
+     * compiler/linker cannot mis-resolve the InfoA symbols. If cal bytes
+     * are erased (0xFF), fall back to a known-good RSEL/DCO combination
+     * that lands close to 1 MHz on the G2553 (RSEL=7, DCO=3). */
+    {
+        volatile unsigned char *p_calbc1 = (volatile unsigned char *)0x10FFu;
+        volatile unsigned char *p_caldco = (volatile unsigned char *)0x10FEu;
+        unsigned char cal_bc1 = *p_calbc1;
+        unsigned char cal_dco = *p_caldco;
+        DCOCTL  = 0;
+        if (cal_bc1 == 0xFF || cal_dco == 0xFF) {
+            BCSCTL1 = XT2OFF | 0x07;          /* RSEL = 7  (~1 MHz nominal) */
+            DCOCTL  = (3u << 5);              /* DCO  = 3                   */
+        } else {
+            BCSCTL1 = cal_bc1;
+            DCOCTL  = cal_dco;
+        }
+        BCSCTL2 = 0;                          /* SMCLK = DCOCLK / 1, MCLK = DCOCLK / 1 */
     }
-    DCOCTL  = 0;
-    BCSCTL1 = CALBC1_1MHZ;
-    DCOCTL  = CALDCO_1MHZ;
 
     P1DIR  |=  (BIT0 | BIT1 | BIT6);
     P1OUT  &= ~(BIT0 | BIT1 | BIT6);

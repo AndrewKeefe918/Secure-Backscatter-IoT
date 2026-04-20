@@ -28,18 +28,30 @@ CARRIER_COARSE_SEARCH_HZ = 12_000
 CARRIER_FINE_SEARCH_HZ = 1_500
 
 # Must match the MSP firmware subcarrier (Timer_A CCR0 toggle rate).
-# Observed on the air: 2 kHz fundamental + 4/6/8/10 kHz harmonics.
-SUBCARRIER_HZ = 2000
-NOISE_REF_DELTA_HZ = 600          # further off to avoid WiFi skirts
+# Observed on the air: 1 kHz fundamental + 2/3 kHz harmonics.
+SUBCARRIER_HZ = 1000
+# When True, skip the auto-scan and lock to SUBCARRIER_HZ. Set False to
+# let the receiver pick the strongest harmonic on startup.
+FORCE_SUBCARRIER = True
+NOISE_REF_DELTA_HZ = 400          # inside the gaps between harmonics
 BASELINE_FREQ_HZ = 12_000         # out-of-band common-mode reference
 # Bit time scales with the subcarrier: MSP is running ~2x fast, so the
 # real bit period is ~25 ms. Search a wide range so we can lock it.
-BIT_DURATION_MS = 25
-BIT_DURATION_MIN_MS = 15
+BIT_DURATION_MS = 50
+BIT_DURATION_MIN_MS = 40
 BIT_DURATION_MAX_MS = 60
 ENV_WINDOW_MS = 5
 ENV_SAMPLES = SAMPLE_RATE * ENV_WINDOW_MS // 1000
 ENV_PER_BIT = BIT_DURATION_MS // ENV_WINDOW_MS
+# When True, skip the bit-period search and lock epb to ENV_PER_BIT
+# (i.e. trust BIT_DURATION_MS). The MSP G2553 derives its bit timing
+# from the same SMCLK/Timer_A0 as the subcarrier (CCR0=499, 100 ticks
+# per bit -> nominal 50 ms), but the DCO has +/-1 % tolerance and
+# temperature drift. Even a single 5 ms epb slip across a 48-bit
+# packet wrecks the matched filter, so we let the search lock to the
+# actual MSP bit period. Candidate range below is tight around 50 ms.
+FORCE_EPB = False
+_ENV_DUMP_DONE = False
 
 PREAMBLE_BYTE = 0xAA
 SYNC_BYTE = 0x7E
@@ -54,11 +66,13 @@ ACTIVITY_MIN_SPAN_DB = 5.0        # reject ambient WiFi / BT modulation
 WINDOW_MIN_SPAN_DB = 3.0
 PAYLOAD_MIN_MATCH = 20
 PACKET_MIN_MATCH = 32
-SYNC_MIN_MATCH = 11   # out of 16 preamble+sync bits
+SYNC_MIN_MATCH = 10   # out of 16 preamble+sync bits
 
 _min_epb = max(1, int(round(BIT_DURATION_MIN_MS / ENV_WINDOW_MS)))
 _max_epb = max(_min_epb, int(round(BIT_DURATION_MAX_MS / ENV_WINDOW_MS)))
 BIT_PERIOD_CANDIDATES = tuple(range(_min_epb, _max_epb + 1))
+if FORCE_EPB:
+    BIT_PERIOD_CANDIDATES = (ENV_PER_BIT,)
 
 _sync_bits = np.array(
     [(PREAMBLE_BYTE >> (7 - i)) & 1 for i in range(8)] +
@@ -114,7 +128,7 @@ def drain(sdr, n=4):
 
 
 def scan_sidebands(sdr, carrier_offset, n_bufs=32,
-                   freqs_hz=(1000, 2000, 3000, 4000, 5000, 6000, 7000),
+                   freqs_hz=(1000, 2000, 3000),
                    noise_delta=NOISE_REF_DELTA_HZ):
     """
     One-shot sideband scan: for each candidate f, measure pair power at
@@ -191,6 +205,13 @@ def sideband_envelope(samples, carrier_offset, freq=SUBCARRIER_HZ,
                       baseline_freq=BASELINE_FREQ_HZ):
     """Per-window sideband-to-noise ratio in dB.
 
+    The MSP subcarrier is a SQUARE wave (Timer_A0 OUTMOD_4 toggle), so
+    its energy splits across odd harmonics: 1k, 3k, 5k... The
+    fundamental carries ~ (8/pi^2) ~ 81 % of the power and the 3rd
+    harmonic ~ 9 %, but on a quiet band adding the 3rd harmonic gives
+    a real +0.4 dB and helps the matched filter when the fundamental
+    bin happens to sit on a noise spike. We sum |sig|^2 at f and 3f.
+
     A far-off-band bin at +/- baseline_freq is subtracted as a
     common-mode reference: ambient 2.4 GHz traffic (WiFi/BT) hits all
     bins together, so subtracting the out-of-band level suppresses
@@ -205,7 +226,9 @@ def sideband_envelope(samples, carrier_offset, freq=SUBCARRIER_HZ,
     def pwr(f):
         return np.abs(x @ np.exp(-2j * np.pi * f * t) / win) ** 2
 
-    sig = pwr(carrier_offset + freq) + pwr(carrier_offset - freq)
+    # Fundamental + 3rd harmonic (square-wave OOK subcarrier).
+    sig = (pwr(carrier_offset + freq)     + pwr(carrier_offset - freq)
+         + pwr(carrier_offset + 3 * freq) + pwr(carrier_offset - 3 * freq))
     refs = np.stack((
         pwr(carrier_offset + freq - noise_delta),
         pwr(carrier_offset + freq + noise_delta),
@@ -372,6 +395,23 @@ class PacketDecoder:
             print(f"[full ] got={full_got}")
             print(f"[full ] exp={full_exp}")
             print(f"[full ] dif={diff}  ({np.sum(bits == _expected_packet_bits)}/48)")
+            # One-shot envelope dump for offline analysis.
+            global _ENV_DUMP_DONE
+            if not _ENV_DUMP_DONE:
+                pre_pad = 4 * epb
+                post_pad = 4 * epb
+                a = max(0, start - pre_pad)
+                b = min(len(env), start + packet_len + post_pad)
+                np.savez("envelope_dump.npz",
+                         env=env[a:b].astype(np.float32),
+                         start_idx=start - a,
+                         epb=epb,
+                         env_window_ms=ENV_WINDOW_MS,
+                         expected_bits=_expected_packet_bits,
+                         got_bits=bits)
+                print(f"[dump ] wrote envelope_dump.npz  "
+                      f"({b-a} samples, start={start-a}, epb={epb})")
+                _ENV_DUMP_DONE = True
         if sync_match < SYNC_MIN_MATCH:
             return
         if payload_match < PAYLOAD_MIN_MATCH:
@@ -412,7 +452,11 @@ def main():
     carrier_offset = locate_carrier(sdr, n_bufs=16, search_hz=CARRIER_FINE_SEARCH_HZ)
     print(f"Carrier at {carrier_offset:+.1f} Hz\n")
 
-    subcarrier_hz = scan_sidebands(sdr, carrier_offset)
+    if FORCE_SUBCARRIER:
+        subcarrier_hz = SUBCARRIER_HZ
+        print(f"Subcarrier locked to {subcarrier_hz} Hz (FORCE_SUBCARRIER=True)\n")
+    else:
+        subcarrier_hz = scan_sidebands(sdr, carrier_offset)
     print(f"Sidebands at {carrier_offset + subcarrier_hz:+.0f} Hz and "
           f"{carrier_offset - subcarrier_hz:+.0f} Hz\n")
 
@@ -484,7 +528,7 @@ def main():
                     if len(e) == 0:
                         return 0.0, 0.0
                     return float(np.mean(e)), float(np.percentile(e, 90) - np.percentile(e, 10))
-                probes = (1000, 2000, 3000, 4000, 5000, 6000, 7000)
+                probes = (1000, 2000, 3000)
                 parts = []
                 for pf in probes:
                     mean_db, span_db = _bin_stats(pf)
