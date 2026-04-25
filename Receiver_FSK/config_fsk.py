@@ -32,8 +32,6 @@ RENDER_PLOTS = False
 # offline from captured chip streams.
 RX_ONLY_MODE = True
 RX_CAPTURE_NDJSON = "Receiver_FSK/captures/chips_capture.ndjson"
-# In RX-only mode, use a single chip phase to minimize realtime load.
-RX_ONLY_SINGLE_PHASE = True
 # Re-run expensive FFT peak tracking every N frames in RX-only mode.
 RX_ONLY_PEAK_TRACK_EVERY_FRAMES = 8
 # Lightweight monitor snapshots written by the RX-only loop for a separate UI.
@@ -43,13 +41,18 @@ RX_STATUS_EVERY_FRAMES = 5
 RX_MONITOR_SPECTRUM_BINS = 192
 # How often the RX-only loop prints a concise radio/decode status line.
 RX_TERMINAL_STATUS_EVERY_FRAMES = 30
-# Keep the older chip-tail debug stream off by default now that live status/decode is available.
-RX_TERMINAL_DEBUG_ENABLED = False
 # Only search this many most-recent logical bits for live packet reporting.
 LIVE_DECODE_RECENT_BITS = 96
 # Suppress live status/monitor candidates unless they beat these quality gates.
-LIVE_DECODE_MAX_HEADER_ERRORS = 4
+LIVE_DECODE_MAX_HEADER_ERRORS = 2
 LIVE_DECODE_MAX_PAYLOAD_ERRORS = 4
+# Maximum 2-of-3 majority decisions allowed across header+payload window.
+# Lower is stricter (better BER, fewer/late detections).
+LIVE_DECODE_MAX_WEAK_BITS = 6
+# When False, live decode only requires preamble+sync and treats payload as unknown bytes.
+LIVE_DECODE_REQUIRE_KNOWN_PAYLOAD = False
+# Number of payload bytes to extract/display after preamble+sync in unknown-payload mode.
+LIVE_DECODE_PAYLOAD_BYTES = 4
 
 # ---- Display / spectrum -----------------------------------------------------
 TIME_SAMPLES = 1200
@@ -114,10 +117,6 @@ ENV_Y_MIN_SPAN = 0.01
 #   Bits sent MSB-first, 50 ms/bit, 2-second gap between packets.
 PREAMBLE_BYTES = b"\xAA"
 SYNC_BYTES = b"\x7E"
-# No alternate framing needed — AA 7E is the only framing used by this firmware.
-PREAMBLE_BYTES_ALT = b""
-SYNC_BYTES_ALT = b""
-ALT_HEADER_ENABLED = False
 PAYLOAD_BYTES = b"OPEN"
 PACKET_DECODE_ENABLED = not RX_ONLY_MODE
 
@@ -138,8 +137,6 @@ PHASE_HISTORY_BITS = 128
 
 # ---- Runtime jitter telemetry -----------------------------------------------
 # Report host-side timing so we can distinguish decode issues from scheduling jitter.
-JITTER_MONITOR_ENABLED = False
-JITTER_REPORT_EVERY_FRAMES = 30
 # Count a frame as "late" when total processing exceeds this share of buffer time.
 JITTER_LATE_FACTOR = 1.20
 # Count a frame-gap slip when update-to-update gap exceeds this share of buffer time.
@@ -155,21 +152,8 @@ HEADER_LOGS_PER_FRAME = 4
 # Limit header candidates processed per phase/offset per frame.
 HEADER_CANDIDATES_PER_SCAN = 2
 
-# Optional payload-only fallback:
-# If preamble/sync bits are too degraded but payload survives, allow OPEN
-# detection using payload matching alone with a tight bit-error limit.
-PAYLOAD_ONLY_FALLBACK_ENABLED = False
-PAYLOAD_ONLY_MAX_BIT_ERRORS = 4
-
 # If channel/polarity inversion occurs, allow payload matching on bitwise-inverted chips.
 ALLOW_INVERTED_PAYLOAD_MATCH = True
-
-# ---- Fading-adaptive cross-phase MRC (Satori-inspired) ----------------------
-# After per-phase chip slicing, soft-combine all phases weighted by each
-# phase's FSK discrimination margin |m_f1 - m_f0|.  Phases in deep fading
-# (low separation) are naturally down-weighted, exactly analogous to D_c
-# weighting in Satori.  The fused bit stream gets its own packet scan.
-FUSED_DECODE_ENABLED = False
 
 # ---- CFO correction (Satori-inspired two-step adaptation for FSK) ----------
 # Step 1: slow average residual CFO estimate.

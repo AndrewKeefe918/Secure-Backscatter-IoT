@@ -32,9 +32,7 @@ from .packet_decoder_fsk import bits_to_text
 from .packet_decoder_fsk import (
     bits_to_bytes,
     bytes_to_bit_list,
-    find_header_match,
     majority_decode_triplets,
-    safe_ascii,
 )
 
 
@@ -54,10 +52,7 @@ class ReceiverLoopRxOnly:
         self.stop_requested = False
 
         self.bit_samples = config.SAMPLES_PER_CHIP
-        if config.RX_ONLY_SINGLE_PHASE:
-            self.phase_offsets = [0]
-        else:
-            self.phase_offsets = list(range(0, self.bit_samples, config.BIT_PHASE_STEP_SAMPLES))
+        self.phase_offsets = [0]
         self.phase_sample_buffer = np.array([], dtype=np.complex64)
         self.phase_state = {p: PhaseState(next_sample=p) for p in self.phase_offsets}
 
@@ -90,7 +85,6 @@ class ReceiverLoopRxOnly:
         self.last_logic_tail = ""
 
         self.total_bits = 0
-        self.next_debug_bits = config.TERMINAL_DEBUG_BITS_EVERY
 
         self.frame_index = 0
         self.last_frame_start_s: float | None = None
@@ -176,26 +170,39 @@ class ReceiverLoopRxOnly:
         }
         self.capture_file.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
-    def _emit_debug(self) -> None:
-        best_phase = max(self.phase_offsets, key=lambda p: self.phase_state[p].chips_seen)
-        st = self.phase_state[best_phase]
-        chip_tail = bits_to_text(st.chips[-config.TERMINAL_DEBUG_BIT_TAIL:])
-        print(
-            f"[RX DEBUG] phase={best_phase} chips={st.chips_seen} "
-            f"lock={'1' if self.ncc_lock else '0'} ncc_ema={self.ncc_abs_ema:.3f} "
-            f"cfo_hz={self.cfo_total_hz:+.1f} (coarse={self.cfo_coarse_hz:+.1f} fine={self.cfo_fine_hz:+.1f}) "
-            f"chip_tail={chip_tail}",
-            flush=True,
-        )
+    def _weak_triplet_count(
+        self,
+        chips: list[int],
+        decode_offset: int,
+        bit_start: int,
+        bit_count: int,
+    ) -> int:
+        """Count logical bits decided by a weak 2-of-3 majority in a window."""
+        weak = 0
+        step = int(config.REPETITION_CHIPS)
+        for bit_idx in range(bit_start, bit_start + bit_count):
+            chip_start = decode_offset + bit_idx * step
+            chip_end = chip_start + step
+            if chip_end > len(chips):
+                break
+            ones = sum(chips[chip_start:chip_end])
+            if ones not in (0, step):
+                weak += 1
+        return weak
 
     def _update_live_decode_summary(self) -> None:
         header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
-        expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES)
-        payload_len = len(expected_payload_bits)
+        require_known_payload = bool(config.LIVE_DECODE_REQUIRE_KNOWN_PAYLOAD)
+        expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES) if require_known_payload else []
+        payload_len = (
+            len(expected_payload_bits)
+            if require_known_payload
+            else int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
+        )
         packet_bits = len(header_bits) + payload_len
 
         best_text = "No live decode yet"
-        best_score: tuple[int, int, int] | None = None
+        best_score: tuple[int, ...] | None = None
         best_logic_tail = ""
 
         for phase, state in sorted(self.phase_state.items()):
@@ -234,26 +241,42 @@ class ReceiverLoopRxOnly:
                     payload_end = payload_start + payload_len
                     payload_bits = decoded_bits[payload_start:payload_end]
                     payload = bits_to_bytes(payload_bits)
-                    payload_errors_normal = sum(
-                        1 for left, right in zip(payload_bits, expected_payload_bits) if left != right
+                    recency = len(decoded_bits) - payload_end
+                    weak_bits = self._weak_triplet_count(
+                        chips,
+                        decode_offset,
+                        header_idx,
+                        len(header_bits) + payload_len,
                     )
-                    if config.ALLOW_INVERTED_PAYLOAD_MATCH:
-                        payload_errors_inverted = sum(
-                            1 for left, right in zip(payload_bits, expected_payload_bits) if (1 - left) != right
-                        )
-                    else:
-                        payload_errors_inverted = payload_errors_normal
-                    payload_errors = min(payload_errors_normal, payload_errors_inverted)
-                    if payload_errors > config.LIVE_DECODE_MAX_PAYLOAD_ERRORS:
+                    if weak_bits > int(config.LIVE_DECODE_MAX_WEAK_BITS):
                         continue
 
-                    polarity = "inverted" if payload_errors_inverted < payload_errors_normal else "normal"
-                    recency = len(decoded_bits) - payload_end
-                    score = (payload_errors, header_errors, recency)
-                    text = (
-                        f"phase={phase} off={decode_offset} bit={header_idx} herr={header_errors} "
-                        f"perr={payload_errors} {payload.hex().upper()} {safe_ascii(payload)!r} {polarity}"
-                    )
+                    if require_known_payload:
+                        payload_errors_normal = sum(
+                            1 for left, right in zip(payload_bits, expected_payload_bits) if left != right
+                        )
+                        if config.ALLOW_INVERTED_PAYLOAD_MATCH:
+                            payload_errors_inverted = sum(
+                                1 for left, right in zip(payload_bits, expected_payload_bits) if (1 - left) != right
+                            )
+                        else:
+                            payload_errors_inverted = payload_errors_normal
+                        payload_errors = min(payload_errors_normal, payload_errors_inverted)
+                        if payload_errors > config.LIVE_DECODE_MAX_PAYLOAD_ERRORS:
+                            continue
+                        polarity = "inverted" if payload_errors_inverted < payload_errors_normal else "normal"
+                        score = (payload_errors, header_errors, weak_bits, recency)
+                        text = (
+                            f"phase={phase} off={decode_offset} bit={header_idx} herr={header_errors} "
+                            f"perr={payload_errors} weak={weak_bits} payload={payload.hex().upper()} {payload!r} {polarity}"
+                        )
+                    else:
+                        score = (header_errors, weak_bits, recency)
+                        text = (
+                            f"phase={phase} off={decode_offset} bit={header_idx} herr={header_errors} "
+                            f"weak={weak_bits} payload={payload.hex().upper()} {payload!r} unknown"
+                        )
+
                     if best_score is None or score < best_score:
                         best_score = score
                         best_text = text
@@ -440,10 +463,6 @@ class ReceiverLoopRxOnly:
             if chips_added > 0:
                 self.total_bits += chips_added
                 self._update_live_decode_summary()
-                if config.RX_TERMINAL_DEBUG_ENABLED:
-                    while self.total_bits >= self.next_debug_bits:
-                        self._emit_debug()
-                        self.next_debug_bits += config.TERMINAL_DEBUG_BITS_EVERY
 
                 min_next = min(s.next_sample for s in self.phase_state.values())
                 if min_next > self.bit_samples:
@@ -470,22 +489,6 @@ class ReceiverLoopRxOnly:
             self.late_frame_count += 1
         if frame_gap_s > gap_budget_s:
             self.gap_slip_count += 1
-
-        if config.JITTER_MONITOR_ENABLED and self.frame_index % int(config.JITTER_REPORT_EVERY_FRAMES) == 0:
-            overrun_pct = 100.0 * max(0.0, (process_elapsed_s - self.buffer_duration_s)) / self.buffer_duration_s
-            print(
-                "[RX JITTER] "
-                f"frame={self.frame_index} "
-                f"rx_ms={1000.0 * rx_elapsed_s:.1f} (ema={1000.0 * self.rx_time_ema_s:.1f}) "
-                f"proc_ms={1000.0 * process_elapsed_s:.1f} (ema={1000.0 * self.process_time_ema_s:.1f}, max={1000.0 * self.max_process_s:.1f}) "
-                f"gap_ms={(1000.0 * frame_gap_s):.1f} (ema={1000.0 * self.frame_gap_ema_s:.1f}) "
-                f"budget_ms={1000.0 * self.buffer_duration_s:.1f} "
-                f"sched_budget_ms={1000.0 * self.realtime_budget_s:.1f} "
-                f"overrun_pct={overrun_pct:.1f} "
-                f"late_frames={self.late_frame_count} "
-                f"gap_slips={self.gap_slip_count}",
-                flush=True,
-            )
 
         self._write_status_snapshot(peak_hz)
         self._emit_status(peak_hz)

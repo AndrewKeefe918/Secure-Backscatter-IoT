@@ -88,8 +88,12 @@ def main() -> int:
     print(f"  '0' subcarrier : {config.FSK_F0_HZ:.1f} Hz")
     print(f"  Bit duration   : {config.BIT_DURATION_MS:.0f} ms")
     print(f"  Repetition     : {config.REPETITION_CHIPS} chip(s) per bit")
-    print(f"  Expected packet: {config.PREAMBLE_BYTES.hex().upper()} "
-          f"{config.SYNC_BYTES.hex().upper()} '{config.PAYLOAD_BYTES.decode()}'")
+    if config.LIVE_DECODE_REQUIRE_KNOWN_PAYLOAD:
+        print(f"  Expected packet: {config.PREAMBLE_BYTES.hex().upper()} "
+              f"{config.SYNC_BYTES.hex().upper()} '{config.PAYLOAD_BYTES.decode()}'")
+    else:
+        print(f"  Packet detect   : header {config.PREAMBLE_BYTES.hex().upper()} {config.SYNC_BYTES.hex().upper()} + "
+              f"{int(config.LIVE_DECODE_PAYLOAD_BYTES)} unknown payload byte(s)")
 
     if enable_plots:
         bb_win.fig.tight_layout()
