@@ -1,5 +1,6 @@
 # Receiver (FSK)
 
+best version
 This receiver uses binary FSK backscatter modulation:
 - bit `1` at 1.0 kHz subcarrier
 - bit `0` at 1.7 kHz subcarrier
