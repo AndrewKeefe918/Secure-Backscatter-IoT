@@ -44,6 +44,9 @@ class MonitorState:
         self.packet_events = deque(maxlen=6)
         self.packet_bits: list[int] = []
         self.packet_bits_label = "phase=0 off=0"
+        self.last_authenticated_text = ""
+        self.last_authenticated_bits: list[int] = []
+        self.last_authenticated_label = "phase=0 off=0"
 
 
 def _read_status(path: Path) -> dict[str, object] | None:
@@ -80,8 +83,18 @@ def _read_new_capture(path: Path, state: MonitorState) -> None:
 def _update_live_decode(state: MonitorState) -> None:
     analysis = analyze_live_decode(state.chips_by_phase, tail_bits=96, include_matches=True)
     state.last_packet_text = analysis.best_text
-    state.packet_bits = analysis.best_packet_bits
-    state.packet_bits_label = analysis.best_packet_label
+
+    is_auth = "AUTHENTICATED" in analysis.best_text
+    if is_auth and analysis.best_packet_bits:
+        state.packet_bits = list(analysis.best_packet_bits)
+        state.packet_bits_label = analysis.best_packet_label
+        state.last_authenticated_text = analysis.best_text
+        state.last_authenticated_bits = list(analysis.best_packet_bits)
+        state.last_authenticated_label = analysis.best_packet_label
+    elif not state.packet_bits and state.last_authenticated_bits:
+        # Restore held authenticated packet if current analysis has no packet.
+        state.packet_bits = list(state.last_authenticated_bits)
+        state.packet_bits_label = state.last_authenticated_label
 
     for phase, decode_offset, header_idx in analysis.matches:
         key = (phase, decode_offset)
@@ -89,6 +102,19 @@ def _update_live_decode(state: MonitorState) -> None:
             state.last_announced_bit[key] = header_idx
             label = "AUTHENTICATED" if config.SECURE_MODE else "PKT"
             state.packet_events.appendleft(f"{label} phase={phase} off={decode_offset} bit={header_idx}")
+
+
+def _compact_packet_summary(packet_info: str, held: bool) -> str:
+    if "AUTHENTICATED" in packet_info:
+        counter_txt = "?"
+        if "counter=" in packet_info:
+            counter_txt = packet_info.split("counter=", 1)[1].split(" ", 1)[0]
+        suffix = " [holding]" if held else ""
+        return f"auth counter={counter_txt}{suffix}"
+    if "REJECTED" in packet_info:
+        reason = packet_info.split(": ", 1)[1] if ": " in packet_info else "reject"
+        return f"reject: {reason}"
+    return packet_info if packet_info else "Waiting for decoded packet..."
 
 
 def main() -> int:
@@ -184,7 +210,17 @@ def main() -> int:
     ax_bits.set_xlim(0, max(1, len(bit_axis) - 1))
     ax_bits.set_ylim(-0.1, 1.1)
     ax_bits.grid(True, alpha=0.3)
-    bits_text = ax_bits.text(0.01, 0.92, "Waiting for decoded packet...", transform=ax_bits.transAxes, va="top", ha="left", family="Consolas")
+    bits_text = ax_bits.text(
+        0.0,
+        1.35,
+        "Waiting for decoded packet...",
+        transform=ax_bits.transAxes,
+        va="top",
+        ha="left",
+        family="Consolas",
+        fontsize=9,
+        clip_on=False,
+    )
 
     status_text = fig.text(0.01, 0.01, "Waiting for RX status...", ha="left", va="bottom", family="Consolas")
 
@@ -261,15 +297,33 @@ def main() -> int:
             line_bits.set_data(bit_axis, bit_vals)
             ax_bits.set_xlim(0, max(1, bit_vals.size - 1))
             packet_hex = bits_to_bytes(packet_bits).hex().upper()
+            held_suffix = ""
+            if (
+                state.last_authenticated_bits
+                and packet_bits == state.last_authenticated_bits
+                and "AUTHENTICATED" not in state.last_packet_text
+            ):
+                held_suffix = " [holding]"
+            packet_info = state.last_authenticated_text or state.last_packet_text
+            compact_info = _compact_packet_summary(packet_info, held=bool(held_suffix))
             bits_text.set_text(
                 f"hex={packet_hex}\n"
-                f"packet={config.PREAMBLE_BYTES.hex().upper()} {config.SYNC_BYTES.hex().upper()} [len] payload"
+                f"{compact_info}"
             )
         else:
             line_bits.set_data([0.0], [0.0])
             bits_text.set_text("Waiting for decoded packet...")
 
-        events_text = " | ".join(state.packet_events) if state.packet_events else "No recent packet match"
+        if state.packet_events:
+            # Deduplicate repeated label prefix (e.g. "AUTHENTICATED") and show it once.
+            first_label = state.packet_events[0].split(" ", 1)[0]
+            if all(e.startswith(first_label + " ") for e in state.packet_events):
+                stripped = [e[len(first_label) + 1:] for e in state.packet_events]
+                events_text = f"{first_label}: " + " | ".join(stripped)
+            else:
+                events_text = " | ".join(state.packet_events)
+        else:
+            events_text = "No recent packet match"
         sb_pos = status.get("monitor_sideband_pos_dbfs")
         sb_neg = status.get("monitor_sideband_neg_dbfs")
         decode_summary = status.get("decode_summary") or state.last_packet_text
