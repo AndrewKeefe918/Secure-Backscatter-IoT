@@ -1,89 +1,239 @@
-"""Configuration constants for the PlutoSDR backscatter receiver."""
+"""Configuration constants for the PlutoSDR backscatter receiver.
 
+All tunable numeric values used by the receiver pipeline live here. Modules
+import constants from this file; magic numbers should never appear in code.
+"""
+
+# SDR endpoint and RF front-end baseline.
 RX_URI = "ip:192.168.2.1"
 FREQ_HZ = 2.48e9
 SAMPLE_RATE = 1e6
-RX_GAIN_MODE: str = "manual"
+RX_GAIN_MODE = "manual"
 RX_GAIN_DB = 40.0
-RX_BUFFER_SIZE = 65536       # 3.8 Hz/bin — 263 bins between carrier and ±1 kHz sideband
+RX_BUFFER_SIZE = 65536  # 3.8 Hz/bin, ~263 bins between carrier and +/-1 kHz sideband.
 ADC_FULL_SCALE = 2048.0
+RX_RF_BANDWIDTH = 200_000
+
+# GUI refresh and baseband overview plotting.
+ANIMATION_INTERVAL_MS = 100
 TIME_SAMPLES = 1200
+TIME_PLOT_Y_LIMIT = 1.1
+IQ_PANEL_EXTENT_SCALE = 1.4
+IQ_CENTROID_CLIP_LOW_PERCENTILE = 10.0
+IQ_CENTROID_CLIP_HIGH_PERCENTILE = 90.0
 SPECTRUM_SPAN_HZ = 150000.0
-FFT_AVG_ALPHA = 0.1           # ~10-frame memory — ~1s response, good noise rejection
-EXCITER_SEARCH_MIN_HZ = 500.0   # ignore near-DC bins
-EXCITER_SEARCH_MAX_HZ = 40000.0 # prevent false lock on far-out noise peaks
+BASEBAND_FFT_BINS = 512
+FFT_AVG_ALPHA = 0.1  # ~10-frame memory, ~1 s response.
+
+# Carrier search, centered view, and waterfall visualization.
+EXCITER_SEARCH_MIN_HZ = 500.0
+EXCITER_SEARCH_MAX_HZ = 40000.0
 CENTERED_SPAN_HZ = 8000.0
 WATERFALL_ROWS = 120
-WATERFALL_BINS = 512          # lower interpolation cost per frame
-WATERFALL_DYN_RANGE_DB = 28.0 # wider range avoids center saturation and preserves discrete lines
-DC_BLOCK_ALPHA = 0.9998       # cutoff ≈ 32 Hz — well below 1 kHz signal
-RX_RF_BANDWIDTH = 200_000     # AD9361 on-chip analog LPF — rejects noise outside 200 kHz
-ENABLE_FOCUSED_FILTER = False # default off: avoids filter transients/blueout artifacts
-FOCUSED_PASSBAND_HZ = 2500.0
-SIDEBAND_OFFSET_KHZ = 1.0     # 1 kHz subcarrier offset
-SIDEBAND_WINDOW_HZ = 30.0     # ±30 Hz at 3.8 Hz/bin = ±8 bins — tight enough to avoid noise peaks
-SNR_LOCK_THRESHOLD_DB = 20.0  # minimum SNR for a reliable backscatter decode
-ENV_Y_SMOOTH_ALPHA = 0.15     # envelope y-limit smoothing (higher = more responsive)
-ENV_Y_MIN_SPAN = 0.01         # minimum y-span for envelope plot stability
-CENTERED_FREQ_SMOOTH_BINS = 3 # lighter smoothing to keep sidebands sharp
-WATERFALL_ROW_BLEND = 0.75    # favor current frame; less temporal blur
+WATERFALL_BINS = 512
+WATERFALL_DYN_RANGE_DB = 28.0
+DBFS_FLOOR = -140.0
+BASEBAND_FFT_YMAX_DBFS = 5.0
+CARRIER_VIEW_YMIN_DBFS = -120.0
+CARRIER_VIEW_YMAX_DBFS = -60.0
+WATERFALL_VMAX_DBFS = -20.0
+SPECTRUM_NOISE_PERCENTILE = 20
+WATERFALL_NOISE_PERCENTILE = 15
+WATERFALL_CLIM_HEADROOM_DB = 1.0
+NOISE_EXCLUDE_CARRIER_KHZ = 0.5
+
+# Front-end conditioning and sideband criteria.
+DC_BLOCK_ALPHA = 0.9998
+ENABLE_FOCUSED_FILTER = True
+FOCUSED_PASSBAND_HZ = 2200.0
+SIDEBAND_OFFSET_KHZ = 1.0
+SIDEBAND_WINDOW_HZ = 30.0
+SNR_LOCK_THRESHOLD_DB = 20.0
+ENV_Y_SMOOTH_ALPHA = 0.15
+ENV_Y_MIN_SPAN = 0.01
+CENTERED_FREQ_SMOOTH_BINS = 3
+WATERFALL_ROW_BLEND = 0.75
+
+# Symbol/chip timing.
 BIT_DURATION_MS = 50.0
 SUBCARRIER_HZ = 1000.0
-CONTINUOUS_ON_TEST = False
-ALL_ONES_TEST = True
-BIT_NCC_THRESHOLD = 0.20       # fixed fallback threshold for chip decisions
+CONTINUOUS_ON_TEST = False  # When true, packet decode is disabled.
+
+# Chip metric thresholding and demod display.
+BIT_NCC_THRESHOLD = 0.20
 ADAPTIVE_BIT_NCC_THRESHOLD = True
-BIT_NCC_NOISE_ALPHA = 0.05     # EMA speed for |NCC| noise tracking (lower = steadier)
-BIT_NCC_MARGIN = 0.02          # keep threshold close to floor so repeated-1 chips survive
-BIT_NCC_THRESHOLD_MIN = 0.10 if ALL_ONES_TEST else 0.14
-BIT_NCC_THRESHOLD_MAX = 0.30   # allow headroom above floor while still preventing runaway
-DEMOD_FILTER_PASSBAND_HZ = 3500.0
-DEMOD_ENV_SMOOTH_SAMPLES = 48  # moving-average smoothing for envelope display only
-CHIP_VIEW_HISTORY = 96         # chips shown in the lower demod panel (96 * 50 ms = 4.8 s)
+BIT_NCC_NOISE_ALPHA = 0.05
+BIT_NCC_MARGIN = 0.02
+BIT_NCC_THRESHOLD_MIN = 0.16
+BIT_NCC_THRESHOLD_MAX = 0.30
+DEMOD_FILTER_PASSBAND_HZ = 2200.0
+DEMOD_ENV_SMOOTH_SAMPLES = 48
+CHIP_VIEW_HISTORY = 96
+
+# Satori-inspired two-step residual CFO correction.
+SATORI_CFO_ENABLE = True
+SATORI_CFO_AVG_ALPHA = 0.04
+SATORI_CFO_TRACK_RHO = 0.20
+SATORI_CFO_LAG_SAMPLES = 1
+SATORI_CFO_SYMBOL_SAMPLES = 64
+SATORI_CFO_MAX_HZ = 400.0
+SATORI_CFO_TRACK_CONF_THRESHOLD = 0.10
+SATORI_CFO_DECAY_AFTER_UNLOCK_FRAMES = 6
+SATORI_CFO_DECAY_WHEN_UNLOCKED = 0.96
+
+# Packet framing and derived stream geometry.
 PREAMBLE_BYTES = b"\xAA\xAA"
 SYNC_BYTES = b"\xD3\x91"
-PAYLOAD_BYTES = b"\xFF\xFF\xFF\xFF" if ALL_ONES_TEST else b"OPEN"
+PAYLOAD_LENGTH_BYTES = 4
+# Payload acceptance policy:
+# - "off": accept packets based on preamble+sync only (payload-agnostic)
+# - "expected": require payload to match one of EXPECTED_PAYLOADS within PAYLOAD_MAX_BIT_ERRORS
+PAYLOAD_MATCH_MODE = "expected"
+EXPECTED_PAYLOADS = (b"\xFF\xFF\xFF\xFF", b"OPEN")
 PACKET_DECODE_ENABLED = not CONTINUOUS_ON_TEST
-REPETITION_CHIPS = 3
+REPETITION_CHIPS = 1
 SAMPLES_PER_CHIP = int(SAMPLE_RATE * (BIT_DURATION_MS / 1000.0))
 LOGICAL_BIT_DURATION_MS = BIT_DURATION_MS * REPETITION_CHIPS
 SAMPLES_PER_LOGICAL_BIT = SAMPLES_PER_CHIP * REPETITION_CHIPS
-MAJORITY_ONES_THRESHOLD = (REPETITION_CHIPS // 2) + 1  # symmetric majority for packet-mode zeros in preamble/sync
-ENV_WINDOW_CHIPS = 1  # 1 chip = 50 ms. 3 chips (=150 ms) exceeds current RX_BUFFER_SIZE at 1 Msps.
+MAJORITY_ONES_THRESHOLD = (REPETITION_CHIPS // 2) + 1
+ENV_WINDOW_CHIPS = 1
+
+# NCC lock state machine (hysteretic entry/exit).
 NCC_DISPLAY_ALPHA = 0.2
-NCC_ENTER_THRESHOLD = 0.13  # observed EMA often peaks around 0.14–0.17; allow practical lock entry
-NCC_EXIT_THRESHOLD = 0.07   # retain hysteresis to prevent rapid lock churn
-NCC_ENTER_FRAMES = 2        # avoid requiring long consecutive runs in fading channels
-NCC_EXIT_FRAMES = 8         # hold lock through short fades once acquired
-NCC_SOFT_DECODE_THRESHOLD = 0.11  # decode fallback when EMA is strong but lock criteria are narrowly missed
-DECODE_UNLOCK_GRACE_CHIPS = 24  # keep decode alive briefly after lock drops (~1.2 s)
+NCC_ENTER_THRESHOLD = 0.15
+NCC_EXIT_THRESHOLD = 0.07
+NCC_ENTER_FRAMES = 3
+NCC_EXIT_FRAMES = 8
+NCC_HYST_COUNTER_DECAY = 1
+NCC_SOFT_DECODE_THRESHOLD = 0.11
+NCC_FORCE_UNLOCK_THRESHOLD = 0.10
+NCC_FORCE_UNLOCK_FRAMES = 20
+NCC_FORCE_UNLOCK_COUNTER_DECAY = 1
+DECODE_UNLOCK_GRACE_CHIPS = 36
 PACKET_STATUS_HOLD_FRAMES = 20
+
+# Additional false-lock watchdog. If the selected phase saturates to nearly all
+# ones with almost no logical-bit transitions for several updates, force unlock
+# so phase/timing search can recover.
+LOCK_WATCHDOG_ENABLE = False
+LOCK_WATCHDOG_CHIP_WINDOW = 120
+LOCK_WATCHDOG_MIN_CHIPS = 72
+LOCK_WATCHDOG_ONE_RATIO = 0.94
+LOCK_WATCHDOG_MAX_TRANSITIONS = 2
+LOCK_WATCHDOG_MAX_CHIP_TRANSITIONS = 12
+LOCK_WATCHDOG_TRIGGER_UPDATES = 4
+LOCK_WATCHDOG_MAX_NCC_EMA = 0.48
+
+# Structure-aware lock quality gate. Lock is only trusted when the best phase
+# has plausible transition density and non-saturated one/zero ratio.
+LOCK_ENTER_REQUIRE_PHASE_STRUCTURE = True
+LOCK_QUALITY_CHIP_WINDOW = 96
+LOCK_QUALITY_MIN_CHIP_TRANSITIONS = 8
+LOCK_QUALITY_MIN_LOGICAL_TRANSITIONS = 7
+LOCK_QUALITY_ONE_RATIO_MIN = 0.15
+LOCK_QUALITY_ONE_RATIO_MAX = 0.85
+LOCK_QUALITY_VETO_FRAMES = 5
+
+# Console debug cadence.
 TERMINAL_DEBUG_BITS_EVERY = 20
 TERMINAL_DEBUG_BIT_TAIL = 64
+
+# Per-phase slicing and timing recovery.
 BIT_PHASE_STEP_SAMPLES = 5000
 CHIP_TIMING_TRACK_ENABLE = not CONTINUOUS_ON_TEST
-CHIP_TIMING_SEARCH_SAMPLES = 1000   # +/- 1 ms at 1 Msps
-CHIP_TIMING_STEP_SAMPLES = 500      # evaluate early/center/late windows
-CHIP_TIMING_TRACK_MARGIN = 0.02     # only retime when metric is confidently above threshold
-CHIP_TIMING_MIN_ADVANTAGE = 0.01    # require meaningful gain over center to shift timing
-CHIP_TIMING_DRIFT_ALPHA = 0.15      # smoothing for chip-stride adaptation
+CHIP_TIMING_SEARCH_SAMPLES = 1000
+CHIP_TIMING_STEP_SAMPLES = 500
+CHIP_TIMING_TRACK_MARGIN = 0.02
+CHIP_TIMING_MIN_ADVANTAGE = 0.01
+CHIP_TIMING_DRIFT_ALPHA = 0.15
 CHIP_TIMING_STRIDE_MIN_SCALE = 0.90
 CHIP_TIMING_STRIDE_MAX_SCALE = 1.10
+CHIP_TIMING_IDLE_ALPHA = 0.05
+
+# Continuous-ON threshold model.
 CONTINUOUS_ON_THRESHOLD_ALPHA = 0.05
 CONTINUOUS_ON_THRESHOLD_SCALE = 0.55
 CONTINUOUS_ON_THRESHOLD_MAX = 0.22
+
+# Bistable chip decision behavior.
 CHIP_BISTABLE_ENABLE = True
 CHIP_DECISION_HYSTERESIS = 0.0
+CHIP_VIEW_DECISION_SCALE = 0.9
 CHIP_RISE_CONFIRM_CHIPS = 1
 CHIP_FALL_CONFIRM_CHIPS = 1
 CHIP_STICKY_WINDOW_CHIPS = 24
 CHIP_STICKY_ONE_RATIO = 0.80
 CHIP_STICKY_FALL_CONFIRM_CHIPS = 1
 CONTINUOUS_ON_FALL_CONFIRM_CHIPS = 1
+CHIP_METRIC_CLIP_MIN = 0.0
+CHIP_METRIC_CLIP_MAX = 1.0
+
+# Adaptive threshold blend and outlier handling.
+UNLOCK_HIGH_FLOOR_MARGIN = 0.03
+UNLOCK_THRESHOLD_HEADROOM = 0.06
+UNLOCK_BLEND = 0.30
+UNLOCK_HIGH_RELAX_ALPHA = 0.03
+LOCKED_THRESHOLD_HEADROOM = 0.12
+LOCKED_BLEND = 0.45
+HIGH_SPIKE_REJECT_HEADROOM = 0.24
+HIGH_RELAX_ALPHA = 0.02
+BIT_NCC_MIN_HIGH_GAP = 0.02
+
+# History windows and numerical safety guards.
+PHASE_SCORE_WINDOW_CHIPS = 16
+PHASE_SCORE_TRANSITION_CHIPS = 96
+PHASE_SCORE_MIN_TRANSITIONS = 6
+PHASE_SCORE_LOW_TRANSITION_PENALTY = 0.45
+MIN_FFT_NORM = 1e-12
+MIN_SMOOTHED_POWER = 1e-20
+NCC_HISTORY_FRAMES = 200
 PHASE_HISTORY_BITS = 128
-PACKET_DECODE_TOP_PHASES = 2
+
+# Packet candidate arbitration and acceptance tolerances.
+PACKET_DECODE_TOP_PHASES = 4
+PACKET_DECODE_FALLBACK_ALL_PHASES = True
+PACKET_DECODE_REQUIRE_LOCK = False
+HEADER_LOG_MIN_CONFIDENCE = 0.55
+PACKET_MIN_CONFIDENCE = 0.82
+PACKET_MAX_PREAMBLE_ERRORS_ACCEPT = 4
+PACKET_MAX_SYNC_ERRORS_ACCEPT = 2
+PACKET_RELAX_WHEN_LOCKED = True
+PACKET_LOCKED_MIN_NCC_EMA = 0.14
+PACKET_LOCKED_MIN_CONFIDENCE = 0.66
+PACKET_LOCKED_MAX_PREAMBLE_ERRORS_ACCEPT = 6
+PACKET_LOCKED_MAX_SYNC_ERRORS_ACCEPT = 4
 PACKET_MERGE_GAP_BITS = 6
-PACKET_CANDIDATE_SETTLE_BITS = 24 if ALL_ONES_TEST else 8
-HEADER_MAX_BIT_ERRORS = 12 if ALL_ONES_TEST else 10
-PREAMBLE_MIN_TRANSITIONS = 6   # 0xAAAA has 15 ideal transitions; relax for timing-misaligned preamble
-PAYLOAD_MAX_BIT_ERRORS = 1 if ALL_ONES_TEST else 3
+PACKET_CANDIDATE_SETTLE_BITS = 12
+HEADER_MAX_BIT_ERRORS = 10
+PREAMBLE_MIN_TRANSITIONS = 5  # 0xAAAA has 15 ideal transitions.
+PREAMBLE_MAX_BIT_ERRORS = 6
+SYNC_MAX_BIT_ERRORS = 4
+PAYLOAD_MAX_BIT_ERRORS = 3
+PAYLOAD_ERROR_DISABLED_LIMIT = 10**9  # Sentinel when payload matching is disabled.
+
+# DSP numerical guards and shared signal-processing constants.
+MIN_RMS_GUARD = 1e-12  # Floor for envelope/reference RMS to avoid divide-by-zero.
+EMA_INIT_THRESHOLD = 1e-9  # An EMA value at or below this is treated as uninitialised.
+BUTTER_ORDER = 4
+BUTTER_WN_MAX = 0.99
+EXCITER_SNR_KEEP_DB = 10.0  # Below this margin we keep the previous exciter peak.
+
+# Sideband SNR computation.
+SIDEBAND_NOISE_LOW_KHZ = 0.3  # Lower bound (kHz) of the sideband noise reference band.
+SIDEBAND_NOISE_PERCENTILE = 50
+
+# Waterfall carrier-core suppression.
+WATERFALL_CARRIER_CORE_HALF_KHZ = 0.20
+WATERFALL_CARRIER_CORE_HEADROOM_DB = 18.0
+
+# Presentation cadence.
+PHASE_SCORE_DISPLAY_TOP = 3
+
+# Packet-status display strings (single source of truth).
+PACKET_STATUS_IDLE_TEXT = "Waiting for preamble+sync"
+PACKET_STATUS_DISABLED_TEXT = "Continuous ON test: packet decode disabled"
+
+
+def packet_status_default_text() -> str:
+    """Return the idle status text appropriate for the current mode."""
+    return PACKET_STATUS_IDLE_TEXT if PACKET_DECODE_ENABLED else PACKET_STATUS_DISABLED_TEXT

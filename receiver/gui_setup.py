@@ -1,7 +1,7 @@
 """Matplotlib figure and artist initialisation for the receiver GUI.
 
 Each setup_* function builds one window and returns a dataclass holding
-all the artist handles needed by ReceiverLoop.update().
+all the artist handles needed by ReceiverRuntime.update().
 """
 
 from dataclasses import dataclass
@@ -14,7 +14,7 @@ from . import config
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses — typed containers for plot handles passed to ReceiverLoop
+# Dataclasses — typed containers for plot handles passed to ReceiverRuntime
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -26,6 +26,12 @@ class BasebandWindow:
     line_fft_dc_blocked: Any
     exciter_marker: Any
     status: Any
+    ax_iq: Any
+    iq_scatter: Any           # recent raw IQ samples (subsampled)
+    tuning_circle: Any        # Line2D — carrier-locus circle (Satori reference)
+    triangle_line: Any        # Line2D — closed triangle: carrier + ±1 kHz sideband phasors
+    triangle_vertices: Any    # PathCollection — 3 dots at triangle vertices
+    iq_centroid: Any          # PathCollection — single centroid marker
 
 
 @dataclass
@@ -35,7 +41,7 @@ class CarrierWindow:
     line_centered: Any
     waterfall_img: Any
     waterfall_data: np.ndarray
-    centered_axis: np.ndarray   # reused by ReceiverLoop for interpolation / masking
+    centered_axis: np.ndarray   # reused by ReceiverRuntime for interpolation / masking
     sideband_scatter: Any
     snr_threshold_line: Any
     status: Any
@@ -60,10 +66,21 @@ class NccWindow:
 # ---------------------------------------------------------------------------
 
 def setup_baseband_window() -> BasebandWindow:
-    """Create the two-panel baseband window (time domain + spectrum)."""
-    fig, (ax_time, ax_fft) = plt.subplots(2, 1, figsize=(11, 7))
+    """Create the baseband window: time domain + IQ plane (top), spectrum (bottom).
+
+    The IQ panel shows a Satori-style tuning circle (carrier-locus) and the
+    “tuning triangle” formed by the reference (carrier) phasor and the two
+    ±1 kHz backscatter sideband phasors — the three points whose geometry
+    Satori uses to recover residual CFO and pilot weighting.
+    """
+    fig = plt.figure(figsize=(13, 7))
     fig.canvas.manager.set_window_title("Pluto Baseband Receiver")
     fig.suptitle("PlutoSDR Raw Baseband View")
+
+    gs = fig.add_gridspec(2, 3, width_ratios=[2, 2, 1.6], height_ratios=[1, 1])
+    ax_time = fig.add_subplot(gs[0, 0:2])
+    ax_iq = fig.add_subplot(gs[0, 2])
+    ax_fft = fig.add_subplot(gs[1, :])
 
     time_axis = np.arange(config.TIME_SAMPLES)
     (line_i,) = ax_time.plot(time_axis, np.zeros(config.TIME_SAMPLES), label="I", lw=1.0)
@@ -71,27 +88,76 @@ def setup_baseband_window() -> BasebandWindow:
     ax_time.set_title("Time Domain (first samples)")
     ax_time.set_xlabel("Sample")
     ax_time.set_ylabel("Amplitude (normalized)")
-    ax_time.set_ylim(-1.1, 1.1)
+    ax_time.set_ylim(-config.TIME_PLOT_Y_LIMIT, config.TIME_PLOT_Y_LIMIT)
     ax_time.grid(True, alpha=0.3)
     ax_time.legend(loc="upper right")
 
     fft_axis = np.linspace(
-        -config.SPECTRUM_SPAN_HZ / 1000.0, config.SPECTRUM_SPAN_HZ / 1000.0, 512
+        -config.SPECTRUM_SPAN_HZ / 1000.0,
+        config.SPECTRUM_SPAN_HZ / 1000.0,
+        config.BASEBAND_FFT_BINS,
     )
     (line_fft_raw,) = ax_fft.plot(
-        fft_axis, np.full_like(fft_axis, -140.0), lw=0.9, color="0.65", label="Raw spectrum",
+        fft_axis,
+        np.full_like(fft_axis, config.DBFS_FLOOR),
+        lw=0.9,
+        color="0.65",
+        label="Raw spectrum",
     )
     (line_fft_dc_blocked,) = ax_fft.plot(
-        fft_axis, np.full_like(fft_axis, -140.0), lw=1.2, color="C0", label="Processed spectrum",
+        fft_axis,
+        np.full_like(fft_axis, config.DBFS_FLOOR),
+        lw=1.2,
+        color="C0",
+        label="Processed spectrum",
     )
     exciter_marker = ax_fft.axvline(0.0, color="C3", lw=1.0, alpha=0.8, label="Exciter peak")
     ax_fft.axvline(0.0, color="0.3", lw=0.8, alpha=0.35, linestyle="--")
     ax_fft.set_title("Spectrum Near Baseband")
     ax_fft.set_xlabel("Frequency Offset (kHz)")
     ax_fft.set_ylabel("Magnitude (dBFS)")
-    ax_fft.set_ylim(-140.0, 5.0)
+    ax_fft.set_ylim(config.DBFS_FLOOR, config.BASEBAND_FFT_YMAX_DBFS)
     ax_fft.grid(True, alpha=0.3)
     ax_fft.legend(loc="lower left")
+
+    # ---- IQ-plane panel: tuning circle + Satori triangle -----------------
+    ax_iq.set_title("IQ Plane — Tuning Circle & Satori Triangle")
+    ax_iq.set_xlabel("I")
+    ax_iq.set_ylabel("Q")
+    ax_iq.set_aspect("equal", adjustable="box")
+    ax_iq.grid(True, alpha=0.3)
+    ax_iq.axhline(0.0, color="0.5", lw=0.6, alpha=0.5)
+    ax_iq.axvline(0.0, color="0.5", lw=0.6, alpha=0.5)
+    ax_iq.set_xlim(-1.0, 1.0)
+    ax_iq.set_ylim(-1.0, 1.0)
+
+    # Subsampled raw IQ scatter (gray cloud).
+    iq_scatter = ax_iq.scatter(
+        np.zeros(1), np.zeros(1),
+        s=4, c="#888888", alpha=0.35, label="IQ samples",
+    )
+    # Tuning circle — Satori reference: carrier-locus where the reference symbol lives.
+    theta = np.linspace(0.0, 2.0 * np.pi, 256)
+    (tuning_circle,) = ax_iq.plot(
+        np.cos(theta), np.sin(theta),
+        color="C0", lw=1.2, alpha=0.85, label="Tuning circle (carrier)",
+    )
+    # Triangle: 3 vertices = carrier phasor, +1 kHz SB phasor, -1 kHz SB phasor.
+    (triangle_line,) = ax_iq.plot(
+        [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0],
+        color="C3", lw=1.4, alpha=0.9, label="Tuning triangle",
+    )
+    triangle_vertices = ax_iq.scatter(
+        [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+        s=55, c=["#ffaa00", "#44ff88", "#44aaff"],
+        edgecolors="black", linewidths=0.6, zorder=5,
+        label="ref / +SB / -SB",
+    )
+    iq_centroid = ax_iq.scatter(
+        [0.0], [0.0], s=30, facecolors="none", edgecolors="black",
+        linewidths=0.9, marker="o", zorder=6,
+    )
+    ax_iq.legend(loc="upper right", fontsize=7)
 
     status = fig.text(0.01, 0.01, "Connecting...", ha="left", va="bottom")
 
@@ -103,6 +169,12 @@ def setup_baseband_window() -> BasebandWindow:
         line_fft_dc_blocked=line_fft_dc_blocked,
         exciter_marker=exciter_marker,
         status=status,
+        ax_iq=ax_iq,
+        iq_scatter=iq_scatter,
+        tuning_circle=tuning_circle,
+        triangle_line=triangle_line,
+        triangle_vertices=triangle_vertices,
+        iq_centroid=iq_centroid,
     )
 
 
@@ -116,7 +188,7 @@ def setup_carrier_window() -> CarrierWindow:
         -config.CENTERED_SPAN_HZ / 1000.0, config.CENTERED_SPAN_HZ / 1000.0, config.WATERFALL_BINS
     )
     (line_centered,) = ax_centered.plot(
-        centered_axis, np.full_like(centered_axis, -140.0), lw=1.2, color="C0",
+        centered_axis, np.full_like(centered_axis, config.DBFS_FLOOR), lw=1.2, color="C0",
     )
     ax_centered.axvline(0.0, color="C3", lw=1.0, alpha=0.8)
     ax_centered.axvline(
@@ -124,28 +196,27 @@ def setup_carrier_window() -> CarrierWindow:
         linestyle="--", label="±1 kHz SB",
     )
     ax_centered.axvline(-config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.9, alpha=0.7, linestyle="--")
-    ax_centered.legend(loc="upper left", fontsize=8)
     ax_centered.set_title("Carrier-Centered Spectrum")
     ax_centered.set_xlabel("Offset From Carrier (kHz)")
     ax_centered.set_ylabel("Magnitude (dBFS)")
-    ax_centered.set_ylim(-120.0, -60.0)
+    ax_centered.set_ylim(config.CARRIER_VIEW_YMIN_DBFS, config.CARRIER_VIEW_YMAX_DBFS)
     ax_centered.grid(True, alpha=0.3)
 
     sideband_scatter = ax_centered.scatter(
         [-config.SIDEBAND_OFFSET_KHZ, config.SIDEBAND_OFFSET_KHZ],
-        [-140.0, -140.0],
+        [config.DBFS_FLOOR, config.DBFS_FLOOR],
         c=["#ff4444", "#ff4444"], s=80, zorder=5,
         marker="D", edgecolors="white", linewidths=0.8,
         label="SB peaks",
     )
     snr_threshold_line = ax_centered.axhline(
-        -140.0, color="#ff4444", lw=1.0, linestyle=":", alpha=0.85,
+        config.DBFS_FLOOR, color="#ff4444", lw=1.0, linestyle=":", alpha=0.85,
         label=f"SNR={config.SNR_LOCK_THRESHOLD_DB:.0f}dB target",
     )
     ax_centered.legend(loc="upper left", fontsize=8)
 
     waterfall_data = np.full(
-        (config.WATERFALL_ROWS, centered_axis.size), -140.0, dtype=np.float64
+        (config.WATERFALL_ROWS, centered_axis.size), config.DBFS_FLOOR, dtype=np.float64
     )
     waterfall_img = ax_waterfall.imshow(
         waterfall_data,
@@ -153,8 +224,8 @@ def setup_carrier_window() -> CarrierWindow:
         origin="lower",
         extent=[centered_axis[0], centered_axis[-1], 0, config.WATERFALL_ROWS],
         cmap="plasma",
-        vmin=-140.0,
-        vmax=-20.0,
+        vmin=config.DBFS_FLOOR,
+        vmax=config.WATERFALL_VMAX_DBFS,
     )
     ax_waterfall.set_title("Carrier-Centered Waterfall")
     ax_waterfall.set_xlabel("Offset From Carrier (kHz)")
@@ -179,13 +250,12 @@ def setup_carrier_window() -> CarrierWindow:
 
 def setup_ncc_window() -> NccWindow:
     """Create the two-panel NCC demodulator window (NCC history + AM envelope)."""
-    NCC_HISTORY = 200
     ncc_fig, (ax_ncc, ax_env) = plt.subplots(2, 1, figsize=(10, 5))
     ncc_fig.canvas.manager.set_window_title("Coherent 1 kHz Demodulator")
     ncc_fig.suptitle("Coherent AM Demodulation — 1 kHz Square-Wave NCC")
 
-    ncc_history = np.zeros(NCC_HISTORY, dtype=np.float64)
-    ncc_time_axis = np.arange(NCC_HISTORY)
+    ncc_history = np.zeros(config.NCC_HISTORY_FRAMES, dtype=np.float64)
+    ncc_time_axis = np.arange(config.NCC_HISTORY_FRAMES)
     (line_ncc,) = ax_ncc.plot(ncc_time_axis, ncc_history, lw=1.2, color="C2")
     ax_ncc.axhline(0.0, color="0.5", lw=0.8, linestyle="--")
     ax_ncc.axhline(

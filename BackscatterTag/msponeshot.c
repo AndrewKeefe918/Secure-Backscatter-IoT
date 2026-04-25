@@ -2,7 +2,6 @@
 
 #define BIT_DURATION_US 50000UL
 #define PACKET_GAP_US 200000UL
-#define REPETITION_CHIPS 3U
 #define LED_MARKER_PULSES 3U
 #define LED_MARKER_ON_US 20000UL
 #define LED_MARKER_OFF_US 20000UL
@@ -80,20 +79,12 @@ static void send_bit(unsigned char bit)
     __delay_cycles(BIT_DURATION_US);
 }
 
-static void send_coded_bit(unsigned char bit)
-{
-    unsigned char chip;
-    for (chip = 0; chip < REPETITION_CHIPS; chip++) {
-        send_bit(bit);
-    }
-}
-
 static void send_byte(unsigned char value)
 {
     unsigned char i;
     for (i = 0; i < 8; i++) {
         unsigned char bit = (value & 0x80U) ? 1U : 0U;
-        send_coded_bit(bit);
+        send_bit(bit);
         value <<= 1;
     }
 }
@@ -118,7 +109,7 @@ static void send_continuous_ratio_75_25(void)
     /* Repeat logical pattern 1110 forever -> 75% ones / 25% zeros. */
     static const unsigned char pattern[] = {1U, 1U, 1U, 0U};
     static unsigned char idx = 0U;
-    send_coded_bit(pattern[idx]);
+    send_bit(pattern[idx]);
     idx = (unsigned char)((idx + 1U) & 0x03U);
 }
 
