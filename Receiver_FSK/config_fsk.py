@@ -56,18 +56,17 @@ SAMPLES_PER_CHIP = int(SAMPLE_RATE * (BIT_DURATION_MS / 1000.0))
 # When |m_f1 - m_f0| < this, we don't trust the chip; default it to 0.
 # Tune higher to reject noise more aggressively (at the cost of dropping
 # weak-but-real bits), lower to accept marginal chips.
-FSK_DECISION_DEAD_ZONE = 0.02
+FSK_DECISION_DEAD_ZONE = 0.005
 
 # Optional fixed threshold on max(m_f1, m_f0) to ensure SOME signal is
 # present at one of the two frequencies. Below this, a chip is assumed
 # to be noise / silence and decoded as 0.
-FSK_PRESENCE_FLOOR = 0.06
+FSK_PRESENCE_FLOOR = 0.01
 
 # ---- Repetition coding ------------------------------------------------------
-# Set to 1 to disable repetition coding (recommended starting point — FSK's
-# self-normalising decisions don't suffer from threshold drift the way OOK
-# does, so repetition's "stuck high" failure mode is much less of an issue).
-REPETITION_CHIPS = 1
+# Each bit is transmitted 3 times by the firmware (111 for '1', 000 for '0').
+# The receiver majority-votes every 3 chips to recover one bit.
+REPETITION_CHIPS = 3
 LOGICAL_BIT_DURATION_MS = BIT_DURATION_MS * REPETITION_CHIPS
 SAMPLES_PER_LOGICAL_BIT = SAMPLES_PER_CHIP * REPETITION_CHIPS
 MAJORITY_ONES_THRESHOLD = (REPETITION_CHIPS // 2) + 1
@@ -80,8 +79,15 @@ ENV_Y_SMOOTH_ALPHA = 0.15
 ENV_Y_MIN_SPAN = 0.01
 
 # ---- Packet structure -------------------------------------------------------
-PREAMBLE_BYTES = b"\xAA\xAA"
-SYNC_BYTES = b"\xD3\x91"
+# Confirmed from Msp_FSK.c:
+#   const uint8_t packet[6] = { 0xAA, 0x7E, 'O', 'P', 'E', 'N' };
+#   Bits sent MSB-first, 50 ms/bit, 2-second gap between packets.
+PREAMBLE_BYTES = b"\xAA"
+SYNC_BYTES = b"\x7E"
+# No alternate framing needed — AA 7E is the only framing used by this firmware.
+PREAMBLE_BYTES_ALT = b""
+SYNC_BYTES_ALT = b""
+ALT_HEADER_ENABLED = False
 PAYLOAD_BYTES = b"OPEN"
 PACKET_DECODE_ENABLED = True
 
@@ -94,11 +100,37 @@ NCC_EXIT_FRAMES = 8
 PACKET_STATUS_HOLD_FRAMES = 20
 
 # ---- Debugging --------------------------------------------------------------
-TERMINAL_DEBUG_BITS_EVERY = 20
+TERMINAL_DEBUG_BITS_EVERY = 120
 TERMINAL_DEBUG_BIT_TAIL = 64
-BIT_PHASE_STEP_SAMPLES = 5000
+BIT_PHASE_STEP_SAMPLES = 1000
 PHASE_HISTORY_BITS = 128
 
 # ---- Header / payload tolerance ---------------------------------------------
-HEADER_MAX_BIT_ERRORS = 4
-PAYLOAD_MAX_BIT_ERRORS = 1
+# AA (8 bits) + 7E (8 bits) = 16 header bits; allow up to 5 errors for diagnosis.
+HEADER_MAX_BIT_ERRORS = 5
+# 4 bytes = 32 bits; allow up to 4 errors for diagnosis.
+PAYLOAD_MAX_BIT_ERRORS = 4
+
+# Optional payload-only fallback:
+# If preamble/sync bits are too degraded but payload survives, allow OPEN
+# detection using payload matching alone with a tight bit-error limit.
+PAYLOAD_ONLY_FALLBACK_ENABLED = True
+PAYLOAD_ONLY_MAX_BIT_ERRORS = 4
+
+# If channel/polarity inversion occurs, allow payload matching on bitwise-inverted chips.
+ALLOW_INVERTED_PAYLOAD_MATCH = True
+
+# ---- Fading-adaptive cross-phase MRC (Satori-inspired) ----------------------
+# After per-phase chip slicing, soft-combine all phases weighted by each
+# phase's FSK discrimination margin |m_f1 - m_f0|.  Phases in deep fading
+# (low separation) are naturally down-weighted, exactly analogous to D_c
+# weighting in Satori.  The fused bit stream gets its own packet scan.
+FUSED_DECODE_ENABLED = True
+
+# ---- CFO correction (Satori-inspired two-step adaptation for FSK) ----------
+# Step 1: slow average residual CFO estimate.
+# Step 2: faster residual fluctuation tracking around the average.
+CFO_CORRECTION_ENABLED = True
+CFO_COARSE_ALPHA = 0.03
+CFO_FINE_ALPHA = 0.20
+CFO_MAX_ABS_HZ = 3000.0

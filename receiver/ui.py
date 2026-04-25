@@ -9,6 +9,7 @@ from .gui_setup import BasebandWindow
 from .packet import majority_decode_triplets, bits_to_text
 
 
+
 _IQ_THETA = np.linspace(0.0, 2.0 * np.pi, 256)
 _IQ_SCATTER_MAX_PTS = 600
 
@@ -83,24 +84,25 @@ def emit_chip_debug(
     """Emit terminal debug line for the selected phase."""
     st = phase_state[best_phase]
 
-    # Try all chip offsets; pick the one with the most 0<->1 transitions for display.
     best_decoded = majority_decode_triplets(st.chips, 0)
     for off in range(1, repetition_chips):
         cand = majority_decode_triplets(st.chips, off)
-        cand_transitions = sum(a != b for a, b in zip(cand, cand[1:]))
-        best_transitions = sum(a != b for a, b in zip(best_decoded, best_decoded[1:]))
-        if cand_transitions > best_transitions:
+        if sum(a != b for a, b in zip(cand, cand[1:])) > sum(a != b for a, b in zip(best_decoded, best_decoded[1:])):
             best_decoded = cand
-
-    chip_tail = bits_to_text(st.chips[-debug_bit_tail:])
     bit_tail = bits_to_text(best_decoded[-(debug_bit_tail // repetition_chips):])
-    print(
-        f"[RX DEBUG] phase={best_phase} chips={st.chips_seen} "
-        f"ncc_ema={ncc_abs_ema:.3f} lock={int(ncc_lock)} "
-        f"bit_thr={st.bit_ncc_threshold:.3f} noise_ema={st.bit_ncc_noise_ema:.3f} "
-        f"chip_tail={chip_tail} bit_tail={bit_tail}",
-        flush=True,
+
+    lock_str = "LOCKED  " if ncc_lock else "searching"
+    status = (
+        f"  [{lock_str}]  chips={st.chips_seen:<6}  "
+        f"NCC={ncc_abs_ema:.3f}  thr={st.bit_ncc_threshold:.3f}  "
+        f"noise={st.bit_ncc_noise_ema:.3f}  phase={best_phase}  bits={bit_tail}"
     )
+    print(f"\r{status:<90}", end="", flush=True)
+
+
+def log_event(msg: str) -> None:
+    """Print an event message above the in-place status line."""
+    print(f"\x1b[2K\r{msg}", flush=True)
 
 
 def update_chip_view(

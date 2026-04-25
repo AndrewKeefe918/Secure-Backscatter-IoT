@@ -79,11 +79,27 @@ static void transmit_byte(uint8_t b) {
     }
 }
 
+/* Transmit one byte with 3x repetition coding: each bit is sent three times.
+ * Used for preamble and sync so the receiver can majority-vote triplets to
+ * recover the bit even if one of the three chips is corrupted by fading.
+ * Timing: 8 bits * 3 chips/bit * 50 ms/chip = 1200 ms per byte.
+ */
+static void transmit_byte_rep3(uint8_t b) {
+    int8_t i;
+    for (i = 7; i >= 0; i--) {
+        uint8_t bit = (b >> i) & 0x01;
+        transmit_bit(bit);
+        transmit_bit(bit);
+        transmit_bit(bit);
+    }
+}
+
 static void transmit_packet(void) {
     uint8_t i;
     P1OUT |= BIT0;              /* red LED on during packet */
+    /* Full packet with 3-chip repetition coding: every bit sent 3 times. */
     for (i = 0; i < PACKET_LENGTH; i++) {
-        transmit_byte(packet[i]);
+        transmit_byte_rep3(packet[i]);
     }
     P1OUT &= ~BIT0;
 }

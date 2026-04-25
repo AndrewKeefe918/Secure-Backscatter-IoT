@@ -21,6 +21,8 @@ from .dsp_fsk import (
     dc_block_filter,
     compute_spectrum_dbfs,
     bandpass_filter_around_carrier,
+    estimate_residual_cfo_hz,
+    derotate_frequency,
     coherent_ncc,
     coherent_fsk_metrics,
     compute_sideband_snr,
@@ -50,7 +52,19 @@ class PhaseState:
     search_start_by_offset: list[int] = field(
         default_factory=lambda: [0] * config.REPETITION_CHIPS
     )
+    search_start_alt_by_offset: list[int] = field(
+        default_factory=lambda: [0] * config.REPETITION_CHIPS
+    )
     last_header_abs_by_offset: list[int] = field(
+        default_factory=lambda: [-1] * config.REPETITION_CHIPS
+    )
+    last_header_abs_alt_by_offset: list[int] = field(
+        default_factory=lambda: [-1] * config.REPETITION_CHIPS
+    )
+    payload_search_start_by_offset: list[int] = field(
+        default_factory=lambda: [0] * config.REPETITION_CHIPS
+    )
+    last_payload_abs_by_offset: list[int] = field(
         default_factory=lambda: [-1] * config.REPETITION_CHIPS
     )
     chips_seen: int = 0
@@ -79,6 +93,10 @@ class ReceiverLoop:
         self.phase_sample_buffer = np.array([], dtype=np.complex64)
         self.phase_state = {p: PhaseState(next_sample=p) for p in self.phase_offsets}
         self.packet_header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
+        self.packet_header_bits_alt = bytes_to_bit_list(
+            config.PREAMBLE_BYTES_ALT + config.SYNC_BYTES_ALT
+        )
+        self.expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES)
         self.payload_bits_len = len(config.PAYLOAD_BYTES) * 8
         self.packet_status_text = "Waiting for preamble+sync"
         self.packet_status_hold = 0
@@ -91,6 +109,18 @@ class ReceiverLoop:
         self.ncc_lock = False
         self.ncc_enter_count = 0
         self.ncc_exit_count = 0
+
+        # Two-step CFO adaptation state (coarse average + fine residual tracking)
+        self.cfo_coarse_hz = 0.0
+        self.cfo_fine_hz = 0.0
+        self.cfo_total_hz = 0.0
+        self.cfo_phase_rad = 0.0
+
+        # Fading-adaptive cross-phase MRC decode state
+        self._fused_search = [0]
+        self._fused_last_abs = [-1]
+        self._fused_search_alt = [0]
+        self._fused_last_abs_alt = [-1]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -164,59 +194,177 @@ class ReceiverLoop:
             decoded_bits = majority_decode_triplets(state.chips, decode_offset)
             base_bit_index = (state.base_chip_index + decode_offset) // config.REPETITION_CHIPS
 
-            while True:
-                search_start = state.search_start_by_offset[decode_offset]
-                header_idx, header_errors = find_header_match(
-                    decoded_bits, self.packet_header_bits, search_start, config.HEADER_MAX_BIT_ERRORS
-                )
-                if header_idx < 0:
-                    state.search_start_by_offset[decode_offset] = max(
-                        0, len(decoded_bits) - len(self.packet_header_bits) + 1
+            def _scan_with_header(
+                header_bits: list[int],
+                search_list: list[int],
+                last_abs_list: list[int],
+                tag: str,
+            ) -> None:
+                while True:
+                    search_start = search_list[decode_offset]
+                    header_idx, header_errors = find_header_match(
+                        decoded_bits, header_bits, search_start, config.HEADER_MAX_BIT_ERRORS
                     )
-                    break
+                    if header_idx < 0:
+                        search_list[decode_offset] = max(0, len(decoded_bits) - len(header_bits) + 1)
+                        break
 
-                header_abs = base_bit_index + header_idx
-                if header_abs <= state.last_header_abs_by_offset[decode_offset]:
-                    state.search_start_by_offset[decode_offset] = header_idx + 1
-                    continue
+                    header_abs = base_bit_index + header_idx
+                    if header_abs <= last_abs_list[decode_offset]:
+                        search_list[decode_offset] = header_idx + 1
+                        continue
 
-                payload_start = header_idx + len(self.packet_header_bits)
-                payload_end = payload_start + self.payload_bits_len
-                if payload_end > len(decoded_bits):
-                    state.search_start_by_offset[decode_offset] = header_idx
-                    break
+                    payload_start = header_idx + len(header_bits)
+                    payload_end = payload_start + self.payload_bits_len
+                    if payload_end > len(decoded_bits):
+                        search_list[decode_offset] = header_idx
+                        break
 
-                payload = bits_to_bytes(decoded_bits[payload_start:payload_end])
-                payload_hex = payload.hex().upper() if payload else ""
-                print(
-                    f"[RX HEADER] phase={phase} chip_offset={decode_offset} "
-                    f"bit={header_abs} header_errors={header_errors} "
-                    f"payload_hex={payload_hex} payload_ascii={safe_ascii(payload)!r}",
-                    flush=True,
-                )
-
-                if payload == config.PAYLOAD_BYTES:
-                    self.decoded_packets += 1
-                    self.packet_status_text = (
-                        f"Packet: OPEN detected at phase {phase}, offset {decode_offset}"
+                    payload_bits = decoded_bits[payload_start:payload_end]
+                    payload = bits_to_bytes(payload_bits)
+                    payload_hex = payload.hex().upper() if payload else ""
+                    payload_errors_normal = sum(
+                        1
+                        for left, right in zip(payload_bits, self.expected_payload_bits)
+                        if left != right
                     )
+                    if config.ALLOW_INVERTED_PAYLOAD_MATCH:
+                        payload_errors_inverted = sum(
+                            1
+                            for left, right in zip(payload_bits, self.expected_payload_bits)
+                            if (1 - left) != right
+                        )
+                    else:
+                        payload_errors_inverted = payload_errors_normal
+                    use_inverted = payload_errors_inverted < payload_errors_normal
+                    payload_errors = min(payload_errors_normal, payload_errors_inverted)
+                    polarity = "inverted" if use_inverted else "normal"
                     print(
-                        f"[RX PACKET {self.decoded_packets}] phase={phase} chip_offset={decode_offset} "
-                        f"bit={header_abs} header_errors={header_errors} PREAMBLE+SYNC+OPEN",
+                        f"[RX HEADER] phase={phase} chip_offset={decode_offset} "
+                        f"bit={header_abs} {tag} header_errors={header_errors} "
+                        f"payload_errors={payload_errors} payload_polarity={polarity} "
+                        f"payload_hex={payload_hex} payload_ascii={safe_ascii(payload)!r}",
                         flush=True,
                     )
-                else:
-                    self.packet_status_text = (
-                        f"Packet: header phase {phase}, offset {decode_offset}, "
-                        f"errors={header_errors}, payload={payload!r}"
-                    )
 
-                self.packet_status_hold = config.PACKET_STATUS_HOLD_FRAMES
-                state.last_header_abs_by_offset[decode_offset] = header_abs
-                state.search_start_by_offset[decode_offset] = header_idx + 1
+                    if payload_errors <= config.PAYLOAD_MAX_BIT_ERRORS:
+                        self.decoded_packets += 1
+                        self.packet_status_text = (
+                            f"Packet: OPEN detected at phase {phase}, offset {decode_offset}, "
+                            f"{tag}, payload_errors={payload_errors}, payload_polarity={polarity}"
+                        )
+                        print(
+                            f"[RX PACKET {self.decoded_packets}] phase={phase} chip_offset={decode_offset} "
+                            f"bit={header_abs} {tag} header_errors={header_errors} "
+                            f"payload_errors={payload_errors} payload_polarity={polarity} PREAMBLE+SYNC+OPEN",
+                            flush=True,
+                        )
+                    else:
+                        self.packet_status_text = (
+                            f"Packet: header phase {phase}, offset {decode_offset}, "
+                            f"{tag}, errors={header_errors}, payload_errors={payload_errors}, "
+                            f"payload_polarity={polarity}, payload={payload!r}"
+                        )
+
+                    self.packet_status_hold = config.PACKET_STATUS_HOLD_FRAMES
+                    last_abs_list[decode_offset] = header_abs
+                    search_list[decode_offset] = header_idx + 1
+
+            _scan_with_header(
+                self.packet_header_bits,
+                state.search_start_by_offset,
+                state.last_header_abs_by_offset,
+                "primary",
+            )
+            if config.ALT_HEADER_ENABLED and self.packet_header_bits_alt:
+                _scan_with_header(
+                    self.packet_header_bits_alt,
+                    state.search_start_alt_by_offset,
+                    state.last_header_abs_alt_by_offset,
+                    "alternate",
+                )
+
+            # Fallback: payload-only scan for cases where preamble/sync are degraded.
+            if not config.PAYLOAD_ONLY_FALLBACK_ENABLED:
+                continue
+            payload_len = self.payload_bits_len
+            if len(decoded_bits) < payload_len:
+                continue
+            search_start = state.payload_search_start_by_offset[decode_offset]
+            max_idx = len(decoded_bits) - payload_len
+            found_idx = -1
+            found_errors = payload_len + 1
+            for i in range(max(0, search_start), max_idx + 1):
+                candidate = decoded_bits[i : i + payload_len]
+                errors_normal = sum(
+                    1 for left, right in zip(candidate, self.expected_payload_bits) if left != right
+                )
+                if config.ALLOW_INVERTED_PAYLOAD_MATCH:
+                    errors_inverted = sum(
+                        1 for left, right in zip(candidate, self.expected_payload_bits) if (1 - left) != right
+                    )
+                else:
+                    errors_inverted = errors_normal
+                errors = min(errors_normal, errors_inverted)
+                if errors < found_errors:
+                    found_idx = i
+                    found_errors = errors
+                if errors <= config.PAYLOAD_ONLY_MAX_BIT_ERRORS:
+                    found_idx = i
+                    found_errors = errors
+                    break
+
+            if found_idx < 0 or found_errors > config.PAYLOAD_ONLY_MAX_BIT_ERRORS:
+                state.payload_search_start_by_offset[decode_offset] = max(0, len(decoded_bits) - payload_len + 1)
+                continue
+
+            payload_abs = base_bit_index + found_idx
+            if payload_abs <= state.last_payload_abs_by_offset[decode_offset]:
+                state.payload_search_start_by_offset[decode_offset] = found_idx + 1
+                continue
+
+            payload_candidate_bits = decoded_bits[found_idx : found_idx + payload_len]
+            payload_candidate = bits_to_bytes(payload_candidate_bits)
+            payload_candidate_errors_normal = sum(
+                1
+                for left, right in zip(payload_candidate_bits, self.expected_payload_bits)
+                if left != right
+            )
+            if config.ALLOW_INVERTED_PAYLOAD_MATCH:
+                payload_candidate_errors_inverted = sum(
+                    1
+                    for left, right in zip(payload_candidate_bits, self.expected_payload_bits)
+                    if (1 - left) != right
+                )
+            else:
+                payload_candidate_errors_inverted = payload_candidate_errors_normal
+            payload_polarity = (
+                "inverted"
+                if payload_candidate_errors_inverted < payload_candidate_errors_normal
+                else "normal"
+            )
+            self.decoded_packets += 1
+            self.packet_status_text = (
+                f"Packet: OPEN fallback at phase {phase}, offset {decode_offset}, "
+                f"payload_errors={found_errors}, payload_polarity={payload_polarity}"
+            )
+            print(
+                f"[RX PACKET {self.decoded_packets}] phase={phase} chip_offset={decode_offset} "
+                f"bit={payload_abs} payload_errors={found_errors} "
+                f"payload_polarity={payload_polarity} PAYLOAD_ONLY_OPEN",
+                flush=True,
+            )
+            print(
+                f"[RX PAYLOAD] phase={phase} chip_offset={decode_offset} "
+                f"payload_hex={payload_candidate.hex().upper()} payload_ascii={safe_ascii(payload_candidate)!r}",
+                flush=True,
+            )
+            self.packet_status_hold = config.PACKET_STATUS_HOLD_FRAMES
+            state.last_payload_abs_by_offset[decode_offset] = payload_abs
+            state.payload_search_start_by_offset[decode_offset] = found_idx + 1
 
     def _emit_debug(self) -> None:
-        best_phase = max(self.phase_offsets, key=lambda p: self.phase_state[p].chips_seen)
+        best_phase = self._select_best_phase_for_display()
         st = self.phase_state[best_phase]
         best_decoded = majority_decode_triplets(st.chips, 0)
         chip_tail = bits_to_text(st.chips[-config.TERMINAL_DEBUG_BIT_TAIL:])
@@ -224,9 +372,141 @@ class ReceiverLoop:
         print(
             f"[RX DEBUG] phase={best_phase} chips={st.chips_seen} "
             f"lock={'1' if self.ncc_lock else '0'} ncc_ema={self.ncc_abs_ema:.3f} "
+            f"cfo_hz={self.cfo_total_hz:+.1f} (coarse={self.cfo_coarse_hz:+.1f} fine={self.cfo_fine_hz:+.1f}) "
             f"chip_tail={chip_tail} bit_tail={bit_tail}",
             flush=True,
         )
+
+    def _phase_quality_score(self, state: PhaseState) -> float:
+        """Score a phase by recent symbol structure + FSK metric separation.
+
+        This avoids a bias toward phase 0 that can happen when choosing by
+        chips_seen only.
+        """
+        if not state.chips:
+            return -1e9
+
+        recent_len = min(96, len(state.chips))
+        recent = state.chips[-recent_len:]
+        transitions = sum(1 for left, right in zip(recent, recent[1:]) if left != right)
+        transition_rate = transitions / max(recent_len - 1, 1)
+
+        sep_len = min(96, len(state.chip_metrics_f1), len(state.chip_metrics_f0))
+        if sep_len > 0:
+            m1 = np.asarray(state.chip_metrics_f1[-sep_len:], dtype=np.float64)
+            m0 = np.asarray(state.chip_metrics_f0[-sep_len:], dtype=np.float64)
+            separation = float(np.mean(np.abs(m1 - m0)))
+        else:
+            separation = 0.0
+
+        # Tiny chips_seen term only breaks ties for equally good phases.
+        return (8.0 * transition_rate) + (2.0 * separation) + (1e-4 * state.chips_seen)
+
+    def _select_best_phase_for_display(self) -> int:
+        return max(self.phase_offsets, key=lambda p: self._phase_quality_score(self.phase_state[p]))
+
+    def _build_fused_bits(self) -> tuple[list[int], int]:
+        """Soft cross-phase MRC — fading-adaptive recovery for FSK.
+
+        Each phase casts a signed soft vote for each chip position.  The vote
+        magnitude is the FSK discrimination margin |m_f1 - m_f0|, which is the
+        direct analog of the tuning-triangle centroid-distance weight D_c used
+        in Satori.  Phases where the channel has faded (low separation) are
+        automatically down-weighted; phases where one tone clearly dominates
+        carry the decision.
+        """
+        states = list(self.phase_state.values())
+        min_len = min(len(s.chips) for s in states)
+        if min_len < 1:
+            return [], 0
+        fused: list[int] = []
+        for i in range(min_len):
+            soft = 0.0
+            for s in states:
+                idx = len(s.chips) - min_len + i
+                # Signed weighted vote: positive -> '1', negative -> '0'
+                soft += s.chip_metrics_f1[idx] - s.chip_metrics_f0[idx]
+            fused.append(1 if soft > 0.0 else 0)
+        first = states[0]
+        base = first.base_chip_index + (len(first.chips) - min_len)
+        return fused, base
+
+    def _try_decode_fused(self) -> None:
+        """Header + payload scan on the soft-combined fused bit stream."""
+        fused_chips, base = self._build_fused_bits()
+        if not fused_chips:
+            return
+        decoded_bits = majority_decode_triplets(fused_chips, 0)
+        base_bit = base // config.REPETITION_CHIPS
+
+        def _fused_scan(
+            header_bits: list[int],
+            search_list: list[int],
+            last_list: list[int],
+            tag: str,
+        ) -> None:
+            while True:
+                hi, herr = find_header_match(
+                    decoded_bits, header_bits, search_list[0],
+                    config.HEADER_MAX_BIT_ERRORS,
+                )
+                if hi < 0:
+                    search_list[0] = max(0, len(decoded_bits) - len(header_bits) + 1)
+                    break
+                abs_h = base_bit + hi
+                if abs_h <= last_list[0]:
+                    search_list[0] = hi + 1
+                    continue
+                pe = hi + len(header_bits)
+                pend = pe + self.payload_bits_len
+                if pend > len(decoded_bits):
+                    search_list[0] = hi
+                    break
+                pb = decoded_bits[pe:pend]
+                perr_n = sum(
+                    1 for l, r in zip(pb, self.expected_payload_bits) if l != r
+                )
+                if config.ALLOW_INVERTED_PAYLOAD_MATCH:
+                    perr_i = sum(
+                        1 for l, r in zip(pb, self.expected_payload_bits) if (1 - l) != r
+                    )
+                else:
+                    perr_i = perr_n
+                perr = min(perr_n, perr_i)
+                pol = "inverted" if perr_i < perr_n else "normal"
+                payload = bits_to_bytes(pb)
+                phex = payload.hex().upper()
+                print(
+                    f"[RX FUSED HEADER] {tag} bit={abs_h} header_errors={herr} "
+                    f"payload_errors={perr} payload_polarity={pol} payload_hex={phex}",
+                    flush=True,
+                )
+                if perr <= config.PAYLOAD_MAX_BIT_ERRORS:
+                    self.decoded_packets += 1
+                    self.packet_status_text = (
+                        f"Packet: FUSED OPEN {tag} bit={abs_h} perr={perr}"
+                    )
+                    print(
+                        f"[RX FUSED PACKET {self.decoded_packets}] {tag} "
+                        f"bit={abs_h} header_errors={herr} payload_errors={perr} "
+                        f"payload_polarity={pol} PREAMBLE+SYNC+OPEN",
+                        flush=True,
+                    )
+                    self.packet_status_hold = config.PACKET_STATUS_HOLD_FRAMES
+                last_list[0] = abs_h
+                search_list[0] = hi + 1
+
+        _fused_scan(
+            self.packet_header_bits,
+            self._fused_search, self._fused_last_abs,
+            "fused-primary",
+        )
+        if config.ALT_HEADER_ENABLED and self.packet_header_bits_alt:
+            _fused_scan(
+                self.packet_header_bits_alt,
+                self._fused_search_alt, self._fused_last_abs_alt,
+                "fused-alt",
+            )
 
     def _update_fsk_metric_history(self, m_f1: float, m_f0: float, decision: float) -> None:
         self.fw.metric_history_f1 = np.roll(self.fw.metric_history_f1, -1)
@@ -242,8 +522,8 @@ class ReceiverLoop:
 
     def _update_chip_decision_plot(self) -> None:
         """Show the most recent CHIP_VIEW_HISTORY chip metrics + decisions."""
-        # Pick the best phase (most chips seen) as the display source
-        best_phase = max(self.phase_offsets, key=lambda p: self.phase_state[p].chips_seen)
+        # Pick the phase with best recent decode quality as display source.
+        best_phase = self._select_best_phase_for_display()
         st = self.phase_state[best_phase]
         n = self.fw.chip_history_len
 
@@ -383,6 +663,40 @@ class ReceiverLoop:
                 x_dc, peak_hz, config.SAMPLE_RATE, config.DEMOD_FILTER_PASSBAND_HZ
             )
 
+            if config.CFO_CORRECTION_ENABLED and demod.size:
+                n = np.arange(demod.size, dtype=np.float64)
+                mix = np.exp(-1j * 2.0 * np.pi * float(peak_hz) * n / float(config.SAMPLE_RATE))
+                demod_bb = demod.astype(np.complex128) * mix
+
+                residual_hat_hz = estimate_residual_cfo_hz(demod_bb.astype(np.complex64), config.SAMPLE_RATE)
+                max_abs = float(config.CFO_MAX_ABS_HZ)
+                residual_hat_hz = float(np.clip(residual_hat_hz, -max_abs, max_abs))
+
+                self.cfo_coarse_hz = (
+                    (1.0 - config.CFO_COARSE_ALPHA) * self.cfo_coarse_hz
+                    + config.CFO_COARSE_ALPHA * residual_hat_hz
+                )
+                residual_part_hz = residual_hat_hz - self.cfo_coarse_hz
+                self.cfo_fine_hz = (
+                    (1.0 - config.CFO_FINE_ALPHA) * self.cfo_fine_hz
+                    + config.CFO_FINE_ALPHA * residual_part_hz
+                )
+                self.cfo_total_hz = float(
+                    np.clip(self.cfo_coarse_hz + self.cfo_fine_hz, -max_abs, max_abs)
+                )
+
+                demod, self.cfo_phase_rad = derotate_frequency(
+                    demod,
+                    self.cfo_total_hz,
+                    config.SAMPLE_RATE,
+                    self.cfo_phase_rad,
+                )
+            else:
+                self.cfo_coarse_hz = 0.0
+                self.cfo_fine_hz = 0.0
+                self.cfo_total_hz = 0.0
+                self.cfo_phase_rad = 0.0
+
             # Per-buffer FSK metrics for the top trace in the FSK window.
             m_f1_buf, m_f0_buf, decision_buf = coherent_fsk_metrics(
                 demod, peak_hz, config.FSK_F1_HZ, config.FSK_F0_HZ, config.SAMPLE_RATE
@@ -399,6 +713,9 @@ class ReceiverLoop:
                 chips_added += self._slice_chips_for_phase(state, peak_hz)
                 if config.PACKET_DECODE_ENABLED:
                     self._try_decode_packets(phase, state)
+
+            if config.PACKET_DECODE_ENABLED and config.FUSED_DECODE_ENABLED:
+                self._try_decode_fused()
 
             self._update_chip_decision_plot()
 
@@ -424,7 +741,7 @@ class ReceiverLoop:
             fw.status.set_text(
                 f"m_f1={m_f1_buf:.3f} | m_f0={m_f0_buf:.3f} | dec={decision_buf:+.3f} | "
                 f"{'LOCKED' if self.ncc_lock else 'searching'} | "
-                f"Carrier={peak_hz:,.0f} Hz | {self.packet_status_text}"
+                f"Carrier={peak_hz:,.0f} Hz | CFO={self.cfo_total_hz:+.1f} Hz | {self.packet_status_text}"
             )
             fw.fig.canvas.draw_idle()
 

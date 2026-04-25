@@ -16,15 +16,15 @@ python -m receiver.main
 | Module | Role |
 | --- | --- |
 | [`main.py`](main.py) | Entry point plus `ReceiverRuntime` state/coordinator. Initialises SDR/GUI, wires signal handlers, and starts `FuncAnimation`. |
-| [`flow.py`](flow.py) | Per-frame step functions (`process_frontend_frame`, `process_demod_frame`) called by `main.py`. |
+| [`flow.py`](flow.py) | Per-frame orchestration (`process_frontend_frame`, `process_demod_frame`): front-end DSP wiring, lock/decode gating, and immediate force-unlock guard. |
 | [`config.py`](config.py) | All tunable constants (RF, FFT, chip timing, lock thresholds, packet framing, Satori CFO params). No magic numbers in the rest of the code. |
 | [`dsp.py`](dsp.py) | Stateless DSP primitives: IQ normalisation, IIR DC block, spectrum + EMA in power domain, exciter peak finder, sideband SNR, coherent NCC / chip metric, bandpass filter, smoothing. |
 | [`gui_setup.py`](gui_setup.py) | Builds the three Matplotlib windows and returns dataclass containers (`BasebandWindow`, `CarrierWindow`, `NccWindow`) of artist handles. |
 | [`ui.py`](ui.py) | Per-frame artist updates: IQ panel (tuning circle + Satori triangle), chip-view, terminal debug emission. |
 | [`chips.py`](chips.py) | Adaptive chip threshold, multi-phase 50 ms slicer, NCC lock hysteresis, and phase ranking helpers. |
 | [`cfo.py`](cfo.py) | `SatoriCfoCorrector` — two-step residual CFO tracker (slow average + fast even-symbol track). |
-| [`fading.py`](fading.py) | Triangle geometry helpers (area, circumradius, centroid distance) for fading-adaptive pilot weighting. |
-| [`packet.py`](packet.py) | Bit/byte codec, `PacketCandidate` model, and the preamble→sync→payload decode pipeline with candidate scoring/settling. |
+| [`fading.py`](fading.py) | Triangle-geometry and weighting helpers (`fading_weight`, `weighted_voltage_recovery`) for Satori-style fading adaptation; currently utility-only (not wired into the live frame path). |
+| [`packet.py`](packet.py) | Packet-stage codec/model/pipeline (`PacketCandidate`, preamble→sync→payload candidate scoring/settling), plus shared logical-bit downsampling helper (`majority_decode_triplets`) used by chips/lock/UI diagnostics. |
 | [`lock.py`](lock.py) | Lock/watchdog policy module (structure-aware lock gating, quality veto/unlock, decode grace). |
 
 ## Data flow per frame
@@ -58,11 +58,12 @@ sdr.rx()
 ## Why this split
 
 - **`main.py`** is the app orchestrator and owns mutable runtime state.
-- **`flow.py`** keeps the per-frame processing logic in focused step functions.
+- **`flow.py`** keeps per-frame orchestration in focused step functions and centralises demod/lock/decode control flow.
 - **`dsp.py`** holds stateless math.
 - **`chips.py`, `lock.py`, `packet.py`, `cfo.py`** hold stateful demod/lock/decode policy.
 - **`gui_setup.py` + `ui.py`** isolate Matplotlib I/O from signal logic.
 - **`config.py`** is the single source of tunables.
+- **`fading.py`** is an isolated utility module for geometry-based fading experiments.
 
 ## Conventions
 

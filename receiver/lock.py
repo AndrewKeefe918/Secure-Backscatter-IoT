@@ -61,7 +61,7 @@ def _watchdog_unlock(
 
     if streak >= config.LOCK_WATCHDOG_TRIGGER_UPDATES:
         print(
-            f"[RX LOCK] watchdog unlock: phase={best_phase} "
+            f"\x1b[2K\r[RX LOCK] watchdog unlock: phase={best_phase} "
             f"one_ratio={one_ratio:.3f} transitions={best_transitions} chip_trans={chip_transitions} "
             f"ncc_ema={ncc_abs_ema:.3f}",
             flush=True,
@@ -123,7 +123,7 @@ def apply_lock_policy(
 
         if best_phase_ready and (not lock_before_update) and not best_phase_structured:
             print(
-                f"[RX LOCK] enter veto: ncc_ema={ncc_abs_ema:.3f} {state.lock_quality_summary}",
+                f"\x1b[2K\r[RX LOCK] enter veto: ncc_ema={ncc_abs_ema:.3f} {state.lock_quality_summary}",
                 flush=True,
             )
             ncc_lock = False
@@ -133,7 +133,7 @@ def apply_lock_policy(
             state.lock_quality_bad_streak = 0
         elif state.lock_quality_bad_streak >= config.LOCK_QUALITY_VETO_FRAMES:
             print(
-                f"[RX LOCK] quality unlock: ncc_ema={ncc_abs_ema:.3f} "
+                f"\x1b[2K\r[RX LOCK] quality unlock: ncc_ema={ncc_abs_ema:.3f} "
                 f"{state.lock_quality_summary} bad_frames={state.lock_quality_bad_streak}",
                 flush=True,
             )

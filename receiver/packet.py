@@ -193,23 +193,6 @@ def try_decode_packets(
                 preamble_transitions=transitions,
             )
 
-            if (
-                header_abs > st.last_logged_header_abs_by_offset[off]
-                and confidence >= config.HEADER_LOG_MIN_CONFIDENCE
-            ):
-                st.last_logged_header_abs_by_offset[off] = header_abs
-                print(
-                    f"[RX HEADER] phase={phase} chip_offset={off} "
-                    f"bit={header_abs} header_errors={errs} "
-                    f"preamble_errors={preamble_errors} sync_errors={sync_errors} "
-                    f"preamble_transitions={transitions} confidence={confidence:.3f} "
-                    f"preamble_seen={bits_to_text(preamble)} "
-                    f"preamble_expected={bits_to_text(preamble_bits)} "
-                    f"sync_seen={bits_to_text(sync_bits)} "
-                    f"sync_expected={bits_to_text(sync_expected)}",
-                    flush=True,
-                )
-
             p_start = idx + len(packet_header_bits)
             p_end = p_start + payload_bits_len
             if p_end > len(decoded):
@@ -225,6 +208,23 @@ def try_decode_packets(
                 )
             else:
                 payload_errors = 0
+            if (
+                header_abs > st.last_logged_header_abs_by_offset[off]
+                and confidence >= config.HEADER_LOG_MIN_CONFIDENCE
+            ):
+                st.last_logged_header_abs_by_offset[off] = header_abs
+                pre_seen  = bits_to_text(preamble)
+                pre_exp   = bits_to_text(preamble_bits)
+                sync_seen_txt = bits_to_text(sync_bits)
+                sync_exp_txt  = bits_to_text(sync_expected)
+                print(
+                    f"\x1b[2K\r"
+                    f"[HEADER?] conf={confidence:.3f}  err={errs}(pre={preamble_errors} sync={sync_errors} pay={payload_errors})  "
+                    f"trans={transitions}  bit={header_abs}  phase={phase}\n"
+                    f"         pre : {pre_seen} (exp {pre_exp})\n"
+                    f"         sync: {sync_seen_txt} (exp {sync_exp_txt})",
+                    flush=True,
+                )
             candidates.append(
                 PacketCandidate(
                     phase=phase,
@@ -262,7 +262,7 @@ def _accept_packet_candidate(
         f"payload_errors={candidate.payload_errors}"
     )
     print(
-        f"[RX PACKET {decoded_packets}] phase={candidate.phase} chip_offset={candidate.chip_offset} "
+        f"\x1b[2K\r[RX PACKET {decoded_packets}] phase={candidate.phase} chip_offset={candidate.chip_offset} "
         f"bit={candidate.header_abs} header_errors={candidate.header_errors} "
         f"preamble_errors={candidate.preamble_errors} sync_errors={candidate.sync_errors} "
         f"confidence={candidate.confidence:.3f} payload_errors={candidate.payload_errors} "

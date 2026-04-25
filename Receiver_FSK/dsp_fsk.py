@@ -149,6 +149,44 @@ def coherent_fsk_metrics(
     return m_f1, m_f0, decision
 
 
+def estimate_residual_cfo_hz(x: np.ndarray, sample_rate: float) -> float:
+    """Estimate residual CFO from average adjacent-sample phase advance.
+
+    The input is expected to be near-baseband complex IQ. The estimate is
+    robust to amplitude scaling and provides a coarse per-buffer residual
+    frequency offset in Hz.
+    """
+    if x.size < 2:
+        return 0.0
+    z = x[1:].astype(np.complex128) * np.conjugate(x[:-1].astype(np.complex128))
+    c = complex(np.mean(z))
+    if abs(c) < 1e-15:
+        return 0.0
+    return float(np.angle(c) * float(sample_rate) / (2.0 * np.pi))
+
+
+def derotate_frequency(
+    x: np.ndarray,
+    freq_hz: float,
+    sample_rate: float,
+    start_phase_rad: float,
+) -> tuple[np.ndarray, float]:
+    """Apply phase-continuous derotation for a constant frequency offset.
+
+    Returns the corrected signal and the ending phase to carry into the
+    next buffer for continuity.
+    """
+    if x.size == 0 or abs(freq_hz) < 1e-12:
+        return x, float(start_phase_rad)
+    n = np.arange(x.size, dtype=np.float64)
+    w = 2.0 * np.pi * float(freq_hz) / float(sample_rate)
+    phase = float(start_phase_rad) + w * n
+    rot = np.exp(-1j * phase)
+    y = x.astype(np.complex128) * rot
+    end_phase = float((float(start_phase_rad) + w * float(x.size)) % (2.0 * np.pi))
+    return y.astype(np.complex64), end_phase
+
+
 def compute_spectrum_dbfs(x: np.ndarray, sample_rate: float) -> tuple[np.ndarray, np.ndarray]:
     """Blackman window FFT -> dBFS spectrum.
 

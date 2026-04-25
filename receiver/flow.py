@@ -139,7 +139,7 @@ def _apply_force_unlock(runtime: Any) -> None:
             )
         if runtime.ncc_force_unlock_streak >= config.NCC_FORCE_UNLOCK_FRAMES:
             print(
-                f"[RX LOCK] force unlock: weak NCC EMA {runtime.ncc_abs_ema:.3f} for "
+                f"\x1b[2K\r[RX LOCK] force unlock: weak NCC EMA {runtime.ncc_abs_ema:.3f} for "
                 f"{runtime.ncc_force_unlock_streak} frames",
                 flush=True,
             )
