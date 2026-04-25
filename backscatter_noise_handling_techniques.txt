@@ -1,0 +1,349 @@
+Noise Handling Techniques for OOK / Backscatter
+
+This note is written for a simple OOK backscatter system where an MSP430 transmits one packet, and a receiver detects the reflected signal. The goal is to make the packet easier to detect, easier to time-align, and more resistant to noise, carrier leakage, envelope drift, and random bit errors.
+
+1. Use a Subcarrier Instead of Raw Envelope OOK
+
+Do not only switch between "reflect" and "no reflect" slowly and expect the envelope to look clean. A better approach is to put the reflected data on a known subcarrier tone, such as 1 kHz, 2 kHz, or 5 kHz.
+
+Basic idea:
+
+    No backscatter bit: little or no energy at fsub
+    Backscatter bit: strong energy at fsub
+
+This gives the receiver something specific to search for. Instead of trying to detect a messy amplitude change directly, the receiver can band-pass around the known subcarrier and measure energy at that frequency.
+
+This is similar in spirit to how RFID/backscatter systems often use sidebands, subcarriers, FM0, or Miller-style coding rather than relying only on a raw baseband amplitude envelope.
+
+For this setup, the receiver should:
+
+    1. Tune to the carrier / collect IQ samples.
+    2. Remove DC or carrier leakage.
+    3. Band-pass around the chosen subcarrier.
+    4. Detect energy at that subcarrier.
+    5. Convert that energy into chips/bits.
+
+2. Use a Strong Preamble for Packet Detection and Timing
+
+A preamble should do three jobs:
+
+    1. Tell the receiver: "a packet is starting."
+    2. Let the receiver estimate symbol/chip timing.
+    3. Let the receiver estimate high/low thresholds.
+
+A good packet structure is:
+
+    silence / idle
+    preamble: 101010101010...
+    sync word: fixed unique pattern
+    payload: encoded data
+    CRC/checksum
+
+The 0xAA pattern is useful because:
+
+    0xAA = 10101010
+
+This gives regular transitions and helps the receiver lock onto timing.
+
+With the 3-chip coding scheme, it is better to encode the preamble the same way as the payload. That means:
+
+    1 -> 111
+    0 -> 000
+
+So:
+
+    0xAA = 10101010
+
+becomes:
+
+    111 000 111 000 111 000 111 000
+
+This makes the preamble useful for chip timing, threshold estimation, and packet detection.
+
+3. Use 3-Chip Repetition Coding
+
+A simple and effective coding method is:
+
+    Binary 1 -> 111
+    Binary 0 -> 000
+
+Then decode using majority vote:
+
+    111 -> 1
+    110 -> 1
+    101 -> 1
+    011 -> 1
+
+    000 -> 0
+    001 -> 0
+    010 -> 0
+    100 -> 0
+
+This fixes any single-chip error within a 3-chip group.
+
+Example:
+
+    Raw bits:      1   0   1   1   0
+    Encoded:      111 000 111 111 000
+    Noisy rx:     101 000 110 111 010
+    Decoded:      1   0   1   1   0
+
+The cost is that the useful data rate becomes one-third of the chip rate. For a backscatter demo, this is usually worth it.
+
+4. Use Matched Filtering or Integrate-and-Dump Detection
+
+Do not make a bit decision from a single sample. Instead, integrate the energy over each chip or symbol window.
+
+For OOK subcarrier detection:
+
+    For each chip window:
+        multiply/correlate against fsub
+        integrate energy over the chip
+        compare to threshold
+
+A simple receiver pipeline is:
+
+    IQ samples
+    -> remove DC
+    -> band-pass around fsub
+    -> envelope or magnitude squared
+    -> moving average / integrate over chip
+    -> adaptive threshold
+    -> majority decode every 3 chips
+    -> check sync word
+    -> check CRC
+
+This improves SNR because the receiver accumulates signal energy over the expected chip interval instead of trusting instantaneous samples.
+
+5. Use Adaptive Thresholds Instead of Fixed Thresholds
+
+A fixed threshold can fail when distance, orientation, multipath, antenna position, or carrier leakage changes.
+
+A better method is to estimate the threshold from the preamble.
+
+During the preamble:
+
+    estimate average "1" energy
+    estimate average "0" energy
+    threshold = (mean_1 + mean_0) / 2
+
+Then during the payload:
+
+    energy > threshold -> chip = 1
+    energy < threshold -> chip = 0
+
+This matters a lot for backscatter because the reflected signal can change with small movement, cable position, antenna angle, or multipath.
+
+6. Add a CRC or Checksum
+
+The repetition code can correct small chip errors, but it does not tell you whether the final packet is trustworthy. Add an error-detection field.
+
+Simple option:
+
+    payload bytes + checksum byte
+
+Better option:
+
+    payload bytes + CRC-8 or CRC-16
+
+For this project, CRC-8 is probably enough.
+
+The receiver can then report:
+
+    Packet detected, decoded, CRC pass
+
+or:
+
+    Packet detected, decoded, CRC fail, discard
+
+7. Recommended Packet Format
+
+A practical packet format would be:
+
+    PREAMBLE: 0xAA 0xAA 0xAA 0xAA
+    SYNC:     0x4F 0x50 0x45 0x4E    // "OPEN"
+    PAYLOAD:  "OPENOPEN" or command byte
+    CRC:      CRC-8
+
+Then 3-chip encode the whole packet.
+
+Important: encode the whole thing, including the preamble, sync word, payload, and CRC, using:
+
+    1 -> 111
+    0 -> 000
+
+8. Recommended Receiver Flow
+
+For each incoming sample block:
+
+    1. Band-pass around the subcarrier.
+    2. Compute the energy envelope.
+    3. Correlate against the encoded preamble.
+    4. Lock timing.
+    5. Estimate threshold from the preamble.
+    6. Slice chips using the adaptive threshold.
+    7. Majority-vote every 3 chips into 1 bit.
+    8. Check for the sync word.
+    9. Decode the payload.
+    10. Check CRC.
+    11. Accept or reject the packet.
+
+The preamble correlation is important. Do not just start decoding at an arbitrary sample.
+
+9. Conservative Timing Recommendation
+
+A reasonable low-rate setup is:
+
+    chip_rate = 300 chips/s
+    data_rate = 100 bits/s after 3-chip coding
+    subcarrier = 1 kHz to 5 kHz
+
+At:
+
+    fsub = 1 kHz
+    chip_rate = 300 chips/s
+
+each chip is:
+
+    1 / 300 = 3.33 ms
+
+and contains about:
+
+    1000 Hz * 3.33 ms = 3.3 cycles
+
+That is usable, but more cycles per chip is better.
+
+If the receiver sampling rate supports it, consider:
+
+    fsub = 2 kHz or 5 kHz
+    chip_rate = 300 chips/s
+
+This gives more subcarrier cycles per chip and cleaner energy measurements.
+
+10. Techniques Ranked from Simple to Advanced
+
+Technique: Longer preamble
+Fixes: Packet detection and timing
+Cost: More overhead
+
+Technique: 3-chip repetition
+Fixes: Random chip/bit errors
+Cost: 3x lower data rate
+
+Technique: Adaptive threshold
+Fixes: Fading and amplitude drift
+Cost: Simple receiver logic
+
+Technique: Subcarrier detection
+Fixes: DC offset, carrier leakage, messy envelope
+Cost: Needs tone generation/detection
+
+Technique: Matched filter / integrate-and-dump
+Fixes: Low SNR
+Cost: Moderate DSP
+
+Technique: CRC
+Fixes: Bad packet acceptance
+Cost: Tiny overhead
+
+Technique: Interleaving
+Fixes: Burst noise
+Cost: Delay and complexity
+
+Technique: FSK backscatter
+Fixes: Threshold ambiguity
+Cost: More tag/receiver logic
+
+Technique: FM0 / Miller coding
+Fixes: Timing recovery and DC balance
+Cost: Lower data rate and more decoder logic
+
+Technique: Coherent/IQ detection
+Fixes: Sensitivity
+Cost: Much more DSP/hardware
+
+11. Best Recommendation for This Project
+
+Use this stack:
+
+MSP430:
+
+    delay after reset
+    transmit one packet
+    generate OOK subcarrier on/off
+    encode every bit as 111 or 000
+    include preamble + sync + CRC
+
+Receiver:
+
+    band-pass around fsub
+    energy detect
+    preamble correlate
+    adaptive threshold from preamble
+    majority vote 3 chips -> 1 bit
+    verify sync and CRC
+
+This is the right level of sophistication for the current system. It is still simple enough to debug, but it addresses the real backscatter problems:
+
+    weak signal
+    drifting envelope
+    false packet starts
+    random chip errors
+    poor timing alignment
+    carrier leakage
+    multipath fading
+
+12. Suggested Final Packet Example
+
+Human-readable command:
+
+    OPENOPEN
+
+Packet before encoding:
+
+    Preamble: 0xAA 0xAA 0xAA 0xAA
+    Sync:     "OPEN"
+    Payload:  "OPENOPEN"
+    CRC:      CRC-8
+
+Then convert the packet to bits and apply:
+
+    1 -> 111
+    0 -> 000
+
+Then the MSP430 transmits the encoded chip stream by turning the subcarrier on and off.
+
+13. Practical Debugging Notes
+
+Start simple:
+
+    1. First transmit only the encoded preamble repeatedly.
+    2. Verify the receiver can detect the preamble peak.
+    3. Add the sync word.
+    4. Add payload.
+    5. Add CRC.
+    6. Then switch from repeated packets to one-shot transmit after reset.
+
+For receiver debugging, plot these separately:
+
+    raw IQ magnitude
+    band-passed subcarrier signal
+    energy envelope
+    detected chip timing
+    sliced chips
+    majority-decoded bits
+    sync detection location
+    CRC result
+
+If the envelope is ugly but the subcarrier energy is detectable, the system can still work.
+
+References / Useful Background
+
+1. EPCglobal / GS1, EPC Radio-Frequency Identity Protocols Generation-2 UHF RFID Standard:
+   https://www.gs1.org/sites/default/files/docs/epc/Gen2_Protocol_Standard.pdf
+
+2. RFID Tutorial, University of Ottawa:
+   https://www.site.uottawa.ca/~mbolic/elg7177/rfid-tutorial2.pdf
+
+3. Backscattered Signal overview, ScienceDirect:
+   https://www.sciencedirect.com/topics/computer-science/backscattered-signal

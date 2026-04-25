@@ -41,3 +41,121 @@ fp-info-cache
 
 # Python virtual environment
 .venv/
+.venv-*/
+.vendor/
+.theia/
+.vscode/
+vcpkg_installed/
+volk-gr/
+gnuradio/
+# Local-only working files (kept out of the repo for now)
+archive/
+Log/
+_driver_tmp/
+
+# CCS / MSP430 build output
+Blink LED/Debug/
+*.obj
+*.d
+*.out
+*.map
+
+# Captures, screenshots, dumps
+*.npz
+*.png
+*.jpg
+
+# Large text copies of vendor PDFs (keep local, not in repo)
+msp430_*_readable*.txt
+msp430_user_guides_readable_combined.txt
+infoA.txt
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Build / packaging artifacts
+build/
+build_*/
+dist/
+*.egg-info/
+*.egg
+wheels/
+pip-wheel-metadata/
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.cache/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+*.sublime-*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# CCS / Code Composer workspace metadata
+.ccsproject
+.cproject
+.project
+.settings/
+.launches/
+Debug/
+Release/
+*.pjt
+*.wsp
+*.cfg.xml
+
+# MSP430 / embedded build leftovers
+*.hex
+*.elf
+*.lst
+*.lss
+*.su
+*.o
+*.a
+*.lib
+*.i
+*.pp
+
+# SDR / signal capture artifacts
+*.iq
+*.cfile
+*.sigmf-data
+*.sigmf-meta
+*.wav
+*.raw
+*.bin
+
+# Logs
+*.log
+logs/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+secrets.*
+*.pem
+*.key
