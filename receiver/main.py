@@ -65,11 +65,24 @@ def main() -> int:
     print(f"  Gain mode : {config.RX_GAIN_MODE}")
     if config.RX_GAIN_MODE == "manual":
         print(f"  RX gain   : {config.RX_GAIN_DB} dB")
+    if config.CONTINUOUS_ON_TEST:
+        print("  Mode      : Continuous ON test (packet decode disabled)")
 
     bb_win.fig.tight_layout()
     carrier_win.fig.tight_layout()
     _ = animation  # keep reference alive for the event loop
-    plt.show()
+    try:
+        plt.show()
+    finally:
+        try:
+            if hasattr(sdr, "rx_destroy_buffer"):
+                sdr.rx_destroy_buffer()
+        except Exception:
+            pass
+        try:
+            del sdr
+        except Exception:
+            pass
     return 0
 
 

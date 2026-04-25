@@ -97,6 +97,35 @@ def coherent_ncc(
     return ncc, envelope
 
 
+def coherent_chip_metric(
+    x: np.ndarray,
+    carrier_hz: float,
+    mod_hz: float,
+    sample_rate: float,
+) -> float:
+    """Phase-invariant subcarrier presence metric in [0, ~1].
+
+    Computes the AM envelope (after carrier downmix), removes DC, and returns
+    the magnitude of the discrete Fourier coefficient at ``mod_hz`` normalised
+    by the envelope RMS. Independent of the subcarrier starting phase, so
+    short (50 ms) chips no longer suffer the cos(phase) attenuation that the
+    real-valued square-wave NCC suffers from.
+    """
+    if x.size == 0:
+        return 0.0
+    n = np.arange(x.size, dtype=np.float64)
+    mix = np.exp(-1j * 2.0 * np.pi * float(carrier_hz) * n / float(sample_rate))
+    envelope = np.abs(x.astype(np.complex128) * mix)
+    envelope -= envelope.mean()
+    env_rms = float(np.sqrt(np.mean(envelope ** 2)))
+    if env_rms < 1e-12:
+        return 0.0
+    ref = np.exp(-1j * 2.0 * np.pi * float(mod_hz) * n / float(sample_rate))
+    coeff = complex(np.mean(envelope * ref))
+    # sqrt(2) compensates for the half-power split between +/- frequency bins.
+    return float(np.sqrt(2.0) * abs(coeff) / env_rms)
+
+
 def compute_spectrum_dbfs(x: np.ndarray, sample_rate: float) -> tuple[np.ndarray, np.ndarray]:
     """Blackman-Harris window FFT → dBFS spectrum.
 
@@ -140,3 +169,86 @@ def bandpass_filter_around_carrier(
     y_shifted = sp.sosfilt(sos, x_shifted)
     y = y_shifted * upmix
     return y.astype(np.complex64)
+
+
+def ema_spectrum_power_domain(
+    current_dbfs: np.ndarray,
+    previous_dbfs: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """Exponential moving average in linear power, returned in dB.
+
+    Operating in power space (not dB) avoids Jensen's-inequality bias that
+    otherwise pushes averages below the true mean.
+    """
+    current_pow = np.power(10.0, current_dbfs * 0.1)
+    if previous_dbfs.size == 0:
+        smoothed_pow = current_pow
+    else:
+        previous_pow = np.power(10.0, previous_dbfs * 0.1)
+        smoothed_pow = alpha * current_pow + (1.0 - alpha) * previous_pow
+    return 10.0 * np.log10(np.maximum(smoothed_pow, 1e-20))
+
+
+def find_exciter_peak(
+    freqs_hz: np.ndarray,
+    spectrum_dbfs: np.ndarray,
+    in_view_mask: np.ndarray,
+    prev_peak_hz: float,
+    search_min_hz: float,
+    search_max_hz: float,
+    snr_keep_db: float = 10.0,
+) -> tuple[float, float]:
+    """Locate the exciter carrier with sticky tracking.
+
+    Returns (peak_hz, peak_dbfs). If the new candidate is not sufficiently
+    above the median noise, the previous lock is kept to avoid hopping.
+    """
+    search_mask = (np.abs(freqs_hz) >= search_min_hz) & (np.abs(freqs_hz) <= search_max_hz)
+    search_view = in_view_mask & search_mask
+    exciter_freqs = freqs_hz[search_view]
+    exciter_spec = spectrum_dbfs[search_view]
+
+    if exciter_spec.size == 0:
+        idx = int(np.argmin(np.abs(freqs_hz - prev_peak_hz)))
+        return prev_peak_hz, float(spectrum_dbfs[idx])
+
+    best = int(np.argmax(exciter_spec))
+    cand_hz = float(exciter_freqs[best])
+    cand_dbfs = float(exciter_spec[best])
+    noise_ref = float(np.percentile(spectrum_dbfs[in_view_mask], 50))
+
+    if (cand_dbfs - noise_ref) >= snr_keep_db or prev_peak_hz == 0.0:
+        return cand_hz, cand_dbfs
+
+    idx = int(np.argmin(np.abs(freqs_hz - prev_peak_hz)))
+    return prev_peak_hz, float(spectrum_dbfs[idx])
+
+
+def remap_and_compress_centered(
+    target_axis_khz: np.ndarray,
+    source_axis_khz: np.ndarray,
+    source_spec_dbfs: np.ndarray,
+    carrier_core_half_width_khz: float = 0.20,
+    carrier_core_headroom_db: float = 18.0,
+) -> np.ndarray:
+    """Interpolate centered spectrum onto waterfall axis and clip carrier core."""
+    remapped = np.interp(
+        target_axis_khz, source_axis_khz, source_spec_dbfs, left=-140.0, right=-140.0
+    )
+    remapped = np.maximum(remapped, -140.0)
+
+    noise_mask = np.abs(target_axis_khz) > 0.5
+    if noise_mask.any():
+        frame_noise = float(np.percentile(remapped[noise_mask], 20))
+        core_mask = np.abs(target_axis_khz) <= carrier_core_half_width_khz
+        remapped[core_mask] = np.minimum(remapped[core_mask], frame_noise + carrier_core_headroom_db)
+    return remapped
+
+
+def smooth_1d(x: np.ndarray, window_size: int) -> np.ndarray:
+    """Moving-average smoothing. Returns x unchanged for short vectors."""
+    if window_size <= 1 or x.size < window_size:
+        return x
+    kernel = np.ones(window_size, dtype=np.float64) / float(window_size)
+    return np.convolve(x, kernel, mode="same")

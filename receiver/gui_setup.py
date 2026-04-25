@@ -48,6 +48,8 @@ class NccWindow:
     ax_env: Any
     line_ncc: Any
     line_env: Any
+    line_env_bits: Any
+    env_threshold_line: Any
     ncc_status: Any
     ncc_history: np.ndarray
     env_plot_len: int
@@ -201,16 +203,25 @@ def setup_ncc_window() -> NccWindow:
     ax_ncc.legend(loc="upper right", fontsize=8)
     ax_ncc.grid(True, alpha=0.3)
 
-    env_plot_len = min(config.SAMPLES_PER_CHIP * config.ENV_WINDOW_CHIPS, config.RX_BUFFER_SIZE)
+    env_plot_len = config.CHIP_VIEW_HISTORY
+    chip_axis = np.arange(env_plot_len)
     (line_env,) = ax_env.plot(
-        np.arange(env_plot_len), np.zeros(env_plot_len), lw=0.8, color="C0",
+        chip_axis, np.zeros(env_plot_len), lw=1.1, color="C0", label="|NCC| per chip",
     )
-    ax_env.set_ylabel("AM Envelope (AC)")
-    ax_env.set_xlabel("Sample")
+    (line_env_bits,) = ax_env.step(
+        chip_axis, np.zeros(env_plot_len), where="mid", lw=0.9, color="C3", alpha=0.8,
+        label="chip decision (scaled)",
+    )
+    env_threshold_line = ax_env.axhline(
+        config.BIT_NCC_THRESHOLD, color="lime", lw=0.9, linestyle="--", label="chip threshold"
+    )
+    ax_env.set_ylabel("|NCC|")
+    ax_env.set_xlabel("Recent Chip Index")
     ax_env.set_title(
-        f"Demodulated Envelope ({env_plot_len / config.SAMPLE_RATE * 1000.0:.0f} ms window)"
+        f"Chip Decisions ({config.BIT_DURATION_MS:.0f} ms/chip, {env_plot_len} chips history)"
     )
-    ax_env.set_ylim(-0.02, 0.02)
+    ax_env.set_ylim(0.0, 1.0)
+    ax_env.legend(loc="upper right", fontsize=8)
     ax_env.grid(True, alpha=0.3)
 
     ncc_status = ncc_fig.text(0.01, 0.01, "Waiting...", ha="left", va="bottom")
@@ -222,6 +233,8 @@ def setup_ncc_window() -> NccWindow:
         ax_env=ax_env,
         line_ncc=line_ncc,
         line_env=line_env,
+        line_env_bits=line_env_bits,
+        env_threshold_line=env_threshold_line,
         ncc_status=ncc_status,
         ncc_history=ncc_history,
         env_plot_len=env_plot_len,

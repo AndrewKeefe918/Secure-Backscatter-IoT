@@ -71,6 +71,6 @@ def majority_decode_triplets(chips: list[int], start_offset: int) -> list[int]:
     idx = start_offset
     while idx + config.REPETITION_CHIPS <= len(chips):
         triplet = chips[idx : idx + config.REPETITION_CHIPS]
-        decoded.append(1 if sum(triplet) >= 2 else 0)
+        decoded.append(1 if sum(triplet) >= config.MAJORITY_ONES_THRESHOLD else 0)
         idx += config.REPETITION_CHIPS
     return decoded
