@@ -59,7 +59,7 @@ class ReceiverLoop:
         self.env_ylim_high: float = 0.02
 
         # Packet / bit decoding
-        self.bit_samples = int(config.SAMPLE_RATE * (config.BIT_DURATION_MS / 1000.0))
+        self.bit_samples = config.SAMPLES_PER_CHIP
         self.phase_offsets = list(range(0, self.bit_samples, config.BIT_PHASE_STEP_SAMPLES))
         self.phase_sample_buffer: np.ndarray = np.array([], dtype=np.complex64)
         self.packet_header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
@@ -75,6 +75,8 @@ class ReceiverLoop:
         self.ncc_lock: bool = False
         self.ncc_enter_count: int = 0
         self.ncc_exit_count: int = 0
+        self.bit_ncc_noise_ema: float = 0.0
+        self.bit_ncc_threshold: float = float(config.BIT_NCC_THRESHOLD)
 
         # Per-phase decode state
         self.phase_state: dict[int, dict[str, object]] = {
@@ -281,12 +283,24 @@ class ReceiverLoop:
 
         # ---- Coherent AM demodulation ---------------------------------------
         if peak_hz != 0.0:
-            ncc_val, envelope = coherent_ncc(x_raw, peak_hz, 1000.0, config.SAMPLE_RATE)
+            demod_signal = bandpass_filter_around_carrier(
+                x_dc_blocked,
+                peak_hz,
+                config.SAMPLE_RATE,
+                config.DEMOD_FILTER_PASSBAND_HZ,
+            )
+            ncc_val, envelope = coherent_ncc(
+                demod_signal, peak_hz, config.SUBCARRIER_HZ, config.SAMPLE_RATE
+            )
             nw.ncc_history = np.roll(nw.ncc_history, -1)
             nw.ncc_history[-1] = ncc_val
             nw.line_ncc.set_ydata(nw.ncc_history)
 
             env_show = envelope[: nw.env_plot_len]
+            if config.DEMOD_ENV_SMOOTH_SAMPLES > 1 and env_show.size >= config.DEMOD_ENV_SMOOTH_SAMPLES:
+                env_kernel = np.ones(config.DEMOD_ENV_SMOOTH_SAMPLES, dtype=np.float64)
+                env_kernel /= float(config.DEMOD_ENV_SMOOTH_SAMPLES)
+                env_show = np.convolve(env_show, env_kernel, mode="same")
             nw.line_env.set_ydata(env_show)
 
             lo_p = float(np.percentile(env_show, 2.0))
@@ -328,7 +342,7 @@ class ReceiverLoop:
                     self.ncc_enter_count = 0
 
             # ---- Multi-phase 50 ms slicer -----------------------------------
-            self.phase_sample_buffer = np.concatenate((self.phase_sample_buffer, x_raw))
+            self.phase_sample_buffer = np.concatenate((self.phase_sample_buffer, demod_signal))
             phase_chips_added = 0
 
             for phase, state in self.phase_state.items():
@@ -337,8 +351,29 @@ class ReceiverLoop:
 
                 while next_sample + self.bit_samples <= len(self.phase_sample_buffer):
                     bit_chunk = self.phase_sample_buffer[next_sample : next_sample + self.bit_samples]
-                    bit_ncc, _ = coherent_ncc(bit_chunk, peak_hz, 1000.0, config.SAMPLE_RATE)
-                    phase_chips.append(1 if abs(bit_ncc) >= config.BIT_NCC_THRESHOLD else 0)
+                    bit_ncc, _ = coherent_ncc(
+                        bit_chunk, peak_hz, config.SUBCARRIER_HZ, config.SAMPLE_RATE
+                    )
+                    bit_abs_ncc = abs(bit_ncc)
+                    if self.bit_ncc_noise_ema <= 1e-9:
+                        self.bit_ncc_noise_ema = bit_abs_ncc
+                    else:
+                        self.bit_ncc_noise_ema = (
+                            (1.0 - config.BIT_NCC_NOISE_ALPHA) * self.bit_ncc_noise_ema
+                            + config.BIT_NCC_NOISE_ALPHA * bit_abs_ncc
+                        )
+                    if config.ADAPTIVE_BIT_NCC_THRESHOLD:
+                        self.bit_ncc_threshold = float(
+                            np.clip(
+                                self.bit_ncc_noise_ema + config.BIT_NCC_MARGIN,
+                                config.BIT_NCC_THRESHOLD_MIN,
+                                config.BIT_NCC_THRESHOLD_MAX,
+                            )
+                        )
+                    else:
+                        self.bit_ncc_threshold = float(config.BIT_NCC_THRESHOLD)
+
+                    phase_chips.append(1 if bit_abs_ncc >= self.bit_ncc_threshold else 0)
                     next_sample += self.bit_samples
                     state["chips_seen"] = int(state["chips_seen"]) + 1
                     phase_chips_added += 1
@@ -427,6 +462,7 @@ class ReceiverLoop:
                         f"[RX DEBUG] phase={best_phase} "
                         f"chips={int(self.phase_state[best_phase]['chips_seen'])} "
                         f"ncc_ema={self.ncc_abs_ema:.3f} lock={'1' if self.ncc_lock else '0'} "
+                        f"bit_thr={self.bit_ncc_threshold:.3f} noise_ema={self.bit_ncc_noise_ema:.3f} "
                         f"chip_tail={chip_tail} bit_tail={bit_tail}",
                         flush=True,
                     )
