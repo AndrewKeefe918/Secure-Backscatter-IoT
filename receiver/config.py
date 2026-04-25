@@ -43,7 +43,7 @@ LIVE_DECODE_RECENT_BITS = 160
 LIVE_DECODE_TRY_INVERTED = True
 # Suppress live status/monitor candidates unless they beat these quality gates.
 # Allow a single header bit error to recover valid packets under light corruption.
-LIVE_DECODE_MAX_HEADER_ERRORS = 1
+LIVE_DECODE_MAX_HEADER_ERRORS = 0
 # Maximum weak decisions allowed across header+payload window.
 # Lower is stricter (better BER, fewer/late detections).
 LIVE_DECODE_MAX_WEAK_BITS = 2

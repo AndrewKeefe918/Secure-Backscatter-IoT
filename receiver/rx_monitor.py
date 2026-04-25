@@ -8,6 +8,7 @@ Run in a separate terminal:
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -315,25 +316,27 @@ def main() -> int:
             bits_text.set_text("Waiting for decoded packet...")
 
         if state.packet_events:
-            # Deduplicate repeated label prefix (e.g. "AUTHENTICATED") and show it once.
             first_label = state.packet_events[0].split(" ", 1)[0]
             if all(e.startswith(first_label + " ") for e in state.packet_events):
-                stripped = [e[len(first_label) + 1:] for e in state.packet_events]
-                events_text = f"{first_label}: " + " | ".join(stripped)
+                # Strip constant phase=/off= fields, keep only bit= (and any unique fields)
+                def _trim(entry: str) -> str:
+                    entry = entry[len(first_label) + 1:]
+                    entry = re.sub(r'phase=\S+\s*', '', entry)
+                    entry = re.sub(r'off=\S+\s*', '', entry)
+                    return entry.strip()
+                events_text = f"{first_label}: " + " | ".join(_trim(e) for e in state.packet_events)
             else:
                 events_text = " | ".join(state.packet_events)
         else:
             events_text = "No recent packet match"
         sb_pos = status.get("monitor_sideband_pos_dbfs")
         sb_neg = status.get("monitor_sideband_neg_dbfs")
-        decode_summary = status.get("decode_summary") or state.last_packet_text
 
         status_text.set_color("#1b5e20" if locked else "#e65100")
         status_text.set_text(
             f"frame={status.get('frame')}  {lock_text}  phase={status.get('best_phase')}  chips={status.get('chips_seen')}  "
             f"peak={status.get('peak_hz')} Hz  CFO={status.get('cfo_hz')} Hz  NCC={status.get('ncc_ema')}  late={late}  slips={slips}\n"
             f"sidebands: snr={snr_val:.1f} dB  +1k={sb_pos} dBFS  -1k={sb_neg} dBFS  rx/proc/gap={status.get('rx_ms')}/{status.get('proc_ms')}/{status.get('gap_ms')} ms\n"
-            f"best_decode={decode_summary}\n"
             f"events={events_text}"
         )
         return line_centered, waterfall_img, line_bits, bits_text, status_text
