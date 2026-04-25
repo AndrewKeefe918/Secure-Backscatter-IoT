@@ -18,6 +18,7 @@ from matplotlib.animation import FuncAnimation
 from . import config_fsk as config
 from .gui_setup_fsk import setup_baseband_window, setup_carrier_window, setup_fsk_window
 from .receiver_loop_fsk import ReceiverLoop
+from .receiver_loop_rx_only import ReceiverLoopRxOnly
 
 
 def main() -> int:
@@ -33,12 +34,21 @@ def main() -> int:
         sdr.rx_hardwaregain_chan0 = float(config.RX_GAIN_DB)
 
     # ---- GUI windows --------------------------------------------------------
-    bb_win = setup_baseband_window()
-    carrier_win = setup_carrier_window()
-    fsk_win = setup_fsk_window()
+    enable_plots = config.RENDER_PLOTS and not config.RX_ONLY_MODE
+    if enable_plots:
+        bb_win = setup_baseband_window()
+        carrier_win = setup_carrier_window()
+        fsk_win = setup_fsk_window()
+    else:
+        bb_win = None
+        carrier_win = None
+        fsk_win = None
 
     # ---- Receiver loop ------------------------------------------------------
-    loop = ReceiverLoop(sdr, bb_win, carrier_win, fsk_win)
+    if config.RX_ONLY_MODE:
+        loop = ReceiverLoopRxOnly(sdr)
+    else:
+        loop = ReceiverLoop(sdr, bb_win, carrier_win, fsk_win)
 
     # ---- Signal / close handlers --------------------------------------------
     def _request_stop(_sig: int, _frame: FrameType | None) -> None:
@@ -51,14 +61,21 @@ def main() -> int:
     def _close_event(_event: object) -> None:
         loop.stop_requested = True
 
-    bb_win.fig.canvas.mpl_connect("close_event", _close_event)
-    carrier_win.fig.canvas.mpl_connect("close_event", _close_event)
-    fsk_win.fig.canvas.mpl_connect("close_event", _close_event)
+    if enable_plots:
+        bb_win.fig.canvas.mpl_connect("close_event", _close_event)
+        carrier_win.fig.canvas.mpl_connect("close_event", _close_event)
+        fsk_win.fig.canvas.mpl_connect("close_event", _close_event)
 
-    # ---- Start animation ----------------------------------------------------
-    animation = FuncAnimation(
-        bb_win.fig, loop.update, interval=100, blit=False, cache_frame_data=False
-    )
+    animation = None
+    if enable_plots:
+        # ---- Start animation ------------------------------------------------
+        animation = FuncAnimation(
+            bb_win.fig,
+            loop.update,
+            interval=int(config.ANIMATION_INTERVAL_MS),
+            blit=False,
+            cache_frame_data=False,
+        )
 
     print("Starting Pluto FSK receiver...")
     print(f"  RX URI         : {config.RX_URI}")
@@ -74,12 +91,21 @@ def main() -> int:
     print(f"  Expected packet: {config.PREAMBLE_BYTES.hex().upper()} "
           f"{config.SYNC_BYTES.hex().upper()} '{config.PAYLOAD_BYTES.decode()}'")
 
-    bb_win.fig.tight_layout()
-    carrier_win.fig.tight_layout()
+    if enable_plots:
+        bb_win.fig.tight_layout()
+        carrier_win.fig.tight_layout()
     _ = animation  # keep reference alive for the event loop
     try:
-        plt.show()
+        if enable_plots:
+            plt.show()
+        else:
+            print("  Mode           : low-overhead decode (no live plots)")
+            if config.RX_ONLY_MODE:
+                print(f"  Capture output : {config.RX_CAPTURE_NDJSON}")
+            while not loop.stop_requested:
+                loop.update(0)
     finally:
+        loop.close()
         try:
             if hasattr(sdr, "rx_destroy_buffer"):
                 sdr.rx_destroy_buffer()

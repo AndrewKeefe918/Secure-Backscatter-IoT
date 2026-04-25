@@ -21,6 +21,36 @@ RX_GAIN_DB = 40.0
 RX_BUFFER_SIZE = 65536       # 3.8 Hz/bin — sub-bin resolution near sidebands
 ADC_FULL_SCALE = 2048.0
 
+# ---- GUI loop ---------------------------------------------------------------
+# Update callback cadence. Must be <= RX buffer duration to avoid falling behind.
+ANIMATION_INTERVAL_MS = 10
+# When False, skip most plotting/render-only work and run decode with minimal GUI overhead.
+RENDER_PLOTS = False
+
+# ---- Lightweight receiver architecture --------------------------------------
+# Keep the real-time loop as ingest/slicing only and run heavy packet search
+# offline from captured chip streams.
+RX_ONLY_MODE = True
+RX_CAPTURE_NDJSON = "Receiver_FSK/captures/chips_capture.ndjson"
+# In RX-only mode, use a single chip phase to minimize realtime load.
+RX_ONLY_SINGLE_PHASE = True
+# Re-run expensive FFT peak tracking every N frames in RX-only mode.
+RX_ONLY_PEAK_TRACK_EVERY_FRAMES = 8
+# Lightweight monitor snapshots written by the RX-only loop for a separate UI.
+RX_STATUS_JSON = "Receiver_FSK/captures/rx_status.json"
+RX_STATUS_EVERY_FRAMES = 5
+# Number of bins exported in the RX-only monitor spectrum snapshot.
+RX_MONITOR_SPECTRUM_BINS = 192
+# How often the RX-only loop prints a concise radio/decode status line.
+RX_TERMINAL_STATUS_EVERY_FRAMES = 30
+# Keep the older chip-tail debug stream off by default now that live status/decode is available.
+RX_TERMINAL_DEBUG_ENABLED = False
+# Only search this many most-recent logical bits for live packet reporting.
+LIVE_DECODE_RECENT_BITS = 96
+# Suppress live status/monitor candidates unless they beat these quality gates.
+LIVE_DECODE_MAX_HEADER_ERRORS = 4
+LIVE_DECODE_MAX_PAYLOAD_ERRORS = 4
+
 # ---- Display / spectrum -----------------------------------------------------
 TIME_SAMPLES = 1200
 SPECTRUM_SPAN_HZ = 150000.0
@@ -89,7 +119,7 @@ PREAMBLE_BYTES_ALT = b""
 SYNC_BYTES_ALT = b""
 ALT_HEADER_ENABLED = False
 PAYLOAD_BYTES = b"OPEN"
-PACKET_DECODE_ENABLED = True
+PACKET_DECODE_ENABLED = not RX_ONLY_MODE
 
 # ---- NCC lock detection (used for status only in FSK mode) ------------------
 NCC_DISPLAY_ALPHA = 0.2
@@ -100,21 +130,35 @@ NCC_EXIT_FRAMES = 8
 PACKET_STATUS_HOLD_FRAMES = 20
 
 # ---- Debugging --------------------------------------------------------------
-TERMINAL_DEBUG_BITS_EVERY = 120
+TERMINAL_DEBUG_BITS_EVERY = 240
 TERMINAL_DEBUG_BIT_TAIL = 64
-BIT_PHASE_STEP_SAMPLES = 1000
+# 4 ms phase step reduces per-frame phase count to ease realtime pressure.
+BIT_PHASE_STEP_SAMPLES = 4000
 PHASE_HISTORY_BITS = 128
+
+# ---- Runtime jitter telemetry -----------------------------------------------
+# Report host-side timing so we can distinguish decode issues from scheduling jitter.
+JITTER_MONITOR_ENABLED = False
+JITTER_REPORT_EVERY_FRAMES = 30
+# Count a frame as "late" when total processing exceeds this share of buffer time.
+JITTER_LATE_FACTOR = 1.20
+# Count a frame-gap slip when update-to-update gap exceeds this share of buffer time.
+JITTER_GAP_FACTOR = 1.50
 
 # ---- Header / payload tolerance ---------------------------------------------
 # AA (8 bits) + 7E (8 bits) = 16 header bits; allow up to 5 errors for diagnosis.
 HEADER_MAX_BIT_ERRORS = 5
 # 4 bytes = 32 bits; allow up to 4 errors for diagnosis.
 PAYLOAD_MAX_BIT_ERRORS = 4
+# Limit noisy header candidate logging per animation frame to avoid terminal I/O stalls.
+HEADER_LOGS_PER_FRAME = 4
+# Limit header candidates processed per phase/offset per frame.
+HEADER_CANDIDATES_PER_SCAN = 2
 
 # Optional payload-only fallback:
 # If preamble/sync bits are too degraded but payload survives, allow OPEN
 # detection using payload matching alone with a tight bit-error limit.
-PAYLOAD_ONLY_FALLBACK_ENABLED = True
+PAYLOAD_ONLY_FALLBACK_ENABLED = False
 PAYLOAD_ONLY_MAX_BIT_ERRORS = 4
 
 # If channel/polarity inversion occurs, allow payload matching on bitwise-inverted chips.
@@ -125,7 +169,7 @@ ALLOW_INVERTED_PAYLOAD_MATCH = True
 # phase's FSK discrimination margin |m_f1 - m_f0|.  Phases in deep fading
 # (low separation) are naturally down-weighted, exactly analogous to D_c
 # weighting in Satori.  The fused bit stream gets its own packet scan.
-FUSED_DECODE_ENABLED = True
+FUSED_DECODE_ENABLED = False
 
 # ---- CFO correction (Satori-inspired two-step adaptation for FSK) ----------
 # Step 1: slow average residual CFO estimate.

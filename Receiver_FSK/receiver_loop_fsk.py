@@ -12,6 +12,7 @@ Differences from OOK ReceiverLoop:
 """
 
 from dataclasses import dataclass, field
+from time import perf_counter
 
 import numpy as np
 
@@ -23,7 +24,6 @@ from .dsp_fsk import (
     bandpass_filter_around_carrier,
     estimate_residual_cfo_hz,
     derotate_frequency,
-    coherent_ncc,
     coherent_fsk_metrics,
     compute_sideband_snr,
     ema_spectrum_power_domain,
@@ -122,6 +122,27 @@ class ReceiverLoop:
         self._fused_search_alt = [0]
         self._fused_last_abs_alt = [-1]
 
+        # Per-frame header log throttling to keep terminal I/O from stalling decode.
+        self.header_logs_this_frame = 0
+        self.header_logs_suppressed_this_frame = 0
+
+        # Runtime timing telemetry (host jitter / overrun risk visibility).
+        self.frame_index = 0
+        self.last_frame_start_s: float | None = None
+        self.buffer_duration_s = float(config.RX_BUFFER_SIZE) / float(config.SAMPLE_RATE)
+        self.update_interval_s = float(config.ANIMATION_INTERVAL_MS) / 1000.0
+        self.realtime_budget_s = max(self.buffer_duration_s, self.update_interval_s)
+        self.rx_time_ema_s = 0.0
+        self.process_time_ema_s = 0.0
+        self.frame_gap_ema_s = 0.0
+        self.max_process_s = 0.0
+        self.late_frame_count = 0
+        self.gap_slip_count = 0
+
+    def close(self) -> None:
+        # Keep a common interface with RX-only loop.
+        return
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -200,7 +221,10 @@ class ReceiverLoop:
                 last_abs_list: list[int],
                 tag: str,
             ) -> None:
+                candidates_processed = 0
                 while True:
+                    if candidates_processed >= int(config.HEADER_CANDIDATES_PER_SCAN):
+                        break
                     search_start = search_list[decode_offset]
                     header_idx, header_errors = find_header_match(
                         decoded_bits, header_bits, search_start, config.HEADER_MAX_BIT_ERRORS
@@ -239,13 +263,17 @@ class ReceiverLoop:
                     use_inverted = payload_errors_inverted < payload_errors_normal
                     payload_errors = min(payload_errors_normal, payload_errors_inverted)
                     polarity = "inverted" if use_inverted else "normal"
-                    print(
-                        f"[RX HEADER] phase={phase} chip_offset={decode_offset} "
-                        f"bit={header_abs} {tag} header_errors={header_errors} "
-                        f"payload_errors={payload_errors} payload_polarity={polarity} "
-                        f"payload_hex={payload_hex} payload_ascii={safe_ascii(payload)!r}",
-                        flush=True,
-                    )
+                    if self.header_logs_this_frame < int(config.HEADER_LOGS_PER_FRAME):
+                        print(
+                            f"[RX HEADER] phase={phase} chip_offset={decode_offset} "
+                            f"bit={header_abs} {tag} header_errors={header_errors} "
+                            f"payload_errors={payload_errors} payload_polarity={polarity} "
+                            f"payload_hex={payload_hex} payload_ascii={safe_ascii(payload)!r}",
+                            flush=True,
+                        )
+                        self.header_logs_this_frame += 1
+                    else:
+                        self.header_logs_suppressed_this_frame += 1
 
                     if payload_errors <= config.PAYLOAD_MAX_BIT_ERRORS:
                         self.decoded_packets += 1
@@ -269,6 +297,7 @@ class ReceiverLoop:
                     self.packet_status_hold = config.PACKET_STATUS_HOLD_FRAMES
                     last_abs_list[decode_offset] = header_abs
                     search_list[decode_offset] = header_idx + 1
+                    candidates_processed += 1
 
             _scan_with_header(
                 self.packet_header_bits,
@@ -554,21 +583,36 @@ class ReceiverLoop:
 
     def update(self, _frame: int) -> tuple:
         bb, cw, fw = self.bb, self.cw, self.fw
-        artists = (
-            bb.line_i, bb.line_q, bb.line_fft_raw, bb.line_fft_dc_blocked,
-            bb.exciter_marker, cw.line_centered, cw.waterfall_img, bb.status, cw.status,
-        )
+        if config.RENDER_PLOTS:
+            artists = (
+                bb.line_i, bb.line_q, bb.line_fft_raw, bb.line_fft_dc_blocked,
+                bb.exciter_marker, cw.line_centered, cw.waterfall_img, bb.status, cw.status,
+            )
+        else:
+            artists = tuple()
         if self.stop_requested:
             return artists
 
+        frame_start_s = perf_counter()
+        self.frame_index += 1
+        self.header_logs_this_frame = 0
+        self.header_logs_suppressed_this_frame = 0
+        frame_gap_s = 0.0
+        if self.last_frame_start_s is not None:
+            frame_gap_s = frame_start_s - self.last_frame_start_s
+        self.last_frame_start_s = frame_start_s
+
         # ---- Acquire + DC-block --------------------------------------------
+        rx_start_s = perf_counter()
         x_raw = normalize_iq(self.sdr.rx())
+        rx_elapsed_s = perf_counter() - rx_start_s
         x_dc, self.dc_prev_x, self.dc_prev_y = dc_block_filter(
             x_raw, self.dc_prev_x, self.dc_prev_y, config.DC_BLOCK_ALPHA
         )
-        shown = x_raw[: config.TIME_SAMPLES]
-        bb.line_i.set_ydata(np.real(shown))
-        bb.line_q.set_ydata(np.imag(shown))
+        if config.RENDER_PLOTS:
+            shown = x_raw[: config.TIME_SAMPLES]
+            bb.line_i.set_ydata(np.real(shown))
+            bb.line_q.set_ydata(np.imag(shown))
 
         # ---- Spectrum (EMA in power domain) --------------------------------
         freqs_hz, raw_dbfs = compute_spectrum_dbfs(x_raw, config.SAMPLE_RATE)
@@ -585,77 +629,77 @@ class ReceiverLoop:
             config.EXCITER_SEARCH_MIN_HZ, config.EXCITER_SEARCH_MAX_HZ,
         )
         self.prev_peak_hz = peak_hz
-        bb.exciter_marker.set_xdata([peak_hz / 1000.0, peak_hz / 1000.0])
-
-        # ---- Baseband spectrum plot ----------------------------------------
-        freqs_khz = freqs_hz[in_view] / 1000.0
-        bb.line_fft_raw.set_data(freqs_khz, self.smoothed_raw[in_view])
-        bb.line_fft_dc_blocked.set_data(freqs_khz, self.smoothed_dc[in_view])
+        if config.RENDER_PLOTS:
+            bb.exciter_marker.set_xdata([peak_hz / 1000.0, peak_hz / 1000.0])
 
         dc_idx = int(np.argmin(np.abs(freqs_hz)))
         dc_level = float(self.smoothed_raw[dc_idx])
         dc_to_carrier_db = peak_dbfs - dc_level
+        if config.RENDER_PLOTS:
+            # ---- Baseband spectrum plot ----------------------------------------
+            freqs_khz = freqs_hz[in_view] / 1000.0
+            bb.line_fft_raw.set_data(freqs_khz, self.smoothed_raw[in_view])
+            bb.line_fft_dc_blocked.set_data(freqs_khz, self.smoothed_dc[in_view])
 
-        if self.prev_peak_dbfs is None or abs(peak_dbfs - self.prev_peak_dbfs) > 5.0:
-            cw.ax_centered.set_ylim(peak_dbfs - 40.0, peak_dbfs + 10.0)
-            self.prev_peak_dbfs = peak_dbfs
+            if self.prev_peak_dbfs is None or abs(peak_dbfs - self.prev_peak_dbfs) > 5.0:
+                cw.ax_centered.set_ylim(peak_dbfs - 40.0, peak_dbfs + 10.0)
+                self.prev_peak_dbfs = peak_dbfs
 
-        # ---- Centered spectrum ---------------------------------------------
-        centered_freqs_hz = freqs_hz - peak_hz
-        centered_mask = np.abs(centered_freqs_hz) <= config.CENTERED_SPAN_HZ
-        centered_freqs_khz = centered_freqs_hz[centered_mask] / 1000.0
-        centered_spec = smooth_1d(self.smoothed_dc[centered_mask], config.CENTERED_FREQ_SMOOTH_BINS)
-        cw.line_centered.set_data(centered_freqs_khz, centered_spec)
+            # ---- Centered spectrum ---------------------------------------------
+            centered_freqs_hz = freqs_hz - peak_hz
+            centered_mask = np.abs(centered_freqs_hz) <= config.CENTERED_SPAN_HZ
+            centered_freqs_khz = centered_freqs_hz[centered_mask] / 1000.0
+            centered_spec = smooth_1d(self.smoothed_dc[centered_mask], config.CENTERED_FREQ_SMOOTH_BINS)
+            cw.line_centered.set_data(centered_freqs_khz, centered_spec)
 
-        off_carrier = np.abs(centered_freqs_khz) > 0.5
-        if off_carrier.any():
-            noise_y = float(np.percentile(centered_spec[off_carrier], 20))
-            cw.ax_centered.set_ylim(noise_y - 6.0, peak_dbfs + 4.0)
-            self.prev_peak_dbfs = peak_dbfs
+            off_carrier = np.abs(centered_freqs_khz) > 0.5
+            if off_carrier.any():
+                noise_y = float(np.percentile(centered_spec[off_carrier], 20))
+                cw.ax_centered.set_ylim(noise_y - 6.0, peak_dbfs + 4.0)
+                self.prev_peak_dbfs = peak_dbfs
 
-        # ---- Sideband markers (uses '1' frequency) -------------------------
-        snr_db, sb_pos, sb_neg, noise_floor_sb = compute_sideband_snr(
-            centered_freqs_khz, centered_spec,
-            config.SIDEBAND_OFFSET_KHZ, config.SIDEBAND_WINDOW_HZ,
-        )
-        cw.sideband_scatter.set_offsets(np.array([
-            [-config.SIDEBAND_OFFSET_KHZ, sb_neg], [config.SIDEBAND_OFFSET_KHZ, sb_pos]
-        ]))
-        dot_color = "#44ff88" if snr_db >= config.SNR_LOCK_THRESHOLD_DB else "#ff4444"
-        cw.sideband_scatter.set_facecolor([dot_color, dot_color])
-        cw.snr_threshold_line.set_ydata([noise_floor_sb + config.SNR_LOCK_THRESHOLD_DB])
+            # ---- Sideband markers (uses '1' frequency) -------------------------
+            snr_db, sb_pos, sb_neg, noise_floor_sb = compute_sideband_snr(
+                centered_freqs_khz, centered_spec,
+                config.SIDEBAND_OFFSET_KHZ, config.SIDEBAND_WINDOW_HZ,
+            )
+            cw.sideband_scatter.set_offsets(np.array([
+                [-config.SIDEBAND_OFFSET_KHZ, sb_neg], [config.SIDEBAND_OFFSET_KHZ, sb_pos]
+            ]))
+            dot_color = "#44ff88" if snr_db >= config.SNR_LOCK_THRESHOLD_DB else "#ff4444"
+            cw.sideband_scatter.set_facecolor([dot_color, dot_color])
+            cw.snr_threshold_line.set_ydata([noise_floor_sb + config.SNR_LOCK_THRESHOLD_DB])
 
-        # ---- Waterfall ------------------------------------------------------
-        if centered_spec.size:
-            remapped = remap_and_compress_centered(cw.centered_axis, centered_freqs_khz, centered_spec)
-            cw.waterfall_data[:-1] = cw.waterfall_data[1:]
-            if config.WATERFALL_ROWS > 1:
-                remapped = (
-                    config.WATERFALL_ROW_BLEND * remapped
-                    + (1.0 - config.WATERFALL_ROW_BLEND) * cw.waterfall_data[-2]
-                )
-            cw.waterfall_data[-1] = remapped
-            cw.waterfall_img.set_data(cw.waterfall_data)
+            # ---- Waterfall ------------------------------------------------------
+            if centered_spec.size:
+                remapped = remap_and_compress_centered(cw.centered_axis, centered_freqs_khz, centered_spec)
+                cw.waterfall_data[:-1] = cw.waterfall_data[1:]
+                if config.WATERFALL_ROWS > 1:
+                    remapped = (
+                        config.WATERFALL_ROW_BLEND * remapped
+                        + (1.0 - config.WATERFALL_ROW_BLEND) * cw.waterfall_data[-2]
+                    )
+                cw.waterfall_data[-1] = remapped
+                cw.waterfall_img.set_data(cw.waterfall_data)
 
-            wf_axis_mask = np.abs(cw.centered_axis) > 0.5
-            valid = cw.waterfall_data[:, wf_axis_mask]
-            valid = valid[valid > -139.0]
-            if valid.size:
-                nf = float(np.percentile(valid, 15))
-                cw.waterfall_img.set_clim(vmin=nf - 1.0, vmax=nf + config.WATERFALL_DYN_RANGE_DB)
+                wf_axis_mask = np.abs(cw.centered_axis) > 0.5
+                valid = cw.waterfall_data[:, wf_axis_mask]
+                valid = valid[valid > -139.0]
+                if valid.size:
+                    nf = float(np.percentile(valid, 15))
+                    cw.waterfall_img.set_clim(vmin=nf - 1.0, vmax=nf + config.WATERFALL_DYN_RANGE_DB)
 
-        # ---- Status text ----------------------------------------------------
-        bb.status.set_text(
-            f"RX={config.RX_URI} | LO={config.FREQ_HZ/1e9:.3f} GHz | RMS={rms:.4f} FS | "
-            f"Exciter={peak_hz:,.1f} Hz @ {peak_dbfs:.1f} dBFS | DC={dc_level:.1f} dBFS | "
-            f"Carrier-DC={dc_to_carrier_db:.1f} dB"
-        )
-        cw.status.set_text(
-            f"Carrier={peak_hz:,.1f} Hz | Span=±{config.CENTERED_SPAN_HZ/1000.0:.0f} kHz | "
-            f"SB SNR={snr_db:+.1f} dB at ±{config.SIDEBAND_OFFSET_KHZ:.1f} kHz "
-            f"(+={sb_pos:.1f} -={sb_neg:.1f} Noise={noise_floor_sb:.1f} dBFS)"
-        )
-        cw.fig.canvas.draw_idle()
+            # ---- Status text ----------------------------------------------------
+            bb.status.set_text(
+                f"RX={config.RX_URI} | LO={config.FREQ_HZ/1e9:.3f} GHz | RMS={rms:.4f} FS | "
+                f"Exciter={peak_hz:,.1f} Hz @ {peak_dbfs:.1f} dBFS | DC={dc_level:.1f} dBFS | "
+                f"Carrier-DC={dc_to_carrier_db:.1f} dB"
+            )
+            cw.status.set_text(
+                f"Carrier={peak_hz:,.1f} Hz | Span=±{config.CENTERED_SPAN_HZ/1000.0:.0f} kHz | "
+                f"SB SNR={snr_db:+.1f} dB at ±{config.SIDEBAND_OFFSET_KHZ:.1f} kHz "
+                f"(+={sb_pos:.1f} -={sb_neg:.1f} Noise={noise_floor_sb:.1f} dBFS)"
+            )
 
         # ---- FSK demod + packet decode -------------------------------------
         if peak_hz != 0.0:
@@ -701,7 +745,8 @@ class ReceiverLoop:
             m_f1_buf, m_f0_buf, decision_buf = coherent_fsk_metrics(
                 demod, peak_hz, config.FSK_F1_HZ, config.FSK_F0_HZ, config.SAMPLE_RATE
             )
-            self._update_fsk_metric_history(m_f1_buf, m_f0_buf, decision_buf)
+            if config.RENDER_PLOTS:
+                self._update_fsk_metric_history(m_f1_buf, m_f0_buf, decision_buf)
 
             # Lock hysteresis driven by the larger of the two metrics
             self._update_lock_hysteresis(max(m_f1_buf, m_f0_buf))
@@ -710,14 +755,20 @@ class ReceiverLoop:
             self.phase_sample_buffer = np.concatenate((self.phase_sample_buffer, demod))
             chips_added = 0
             for phase, state in self.phase_state.items():
-                chips_added += self._slice_chips_for_phase(state, peak_hz)
-                if config.PACKET_DECODE_ENABLED:
+                phase_added = self._slice_chips_for_phase(state, peak_hz)
+                chips_added += phase_added
+                if config.PACKET_DECODE_ENABLED and phase_added > 0:
                     self._try_decode_packets(phase, state)
 
-            if config.PACKET_DECODE_ENABLED and config.FUSED_DECODE_ENABLED:
+            if (
+                config.PACKET_DECODE_ENABLED
+                and config.FUSED_DECODE_ENABLED
+                and chips_added > 0
+            ):
                 self._try_decode_fused()
 
-            self._update_chip_decision_plot()
+            if config.RENDER_PLOTS:
+                self._update_chip_decision_plot()
 
             if chips_added > 0:
                 self.total_bits += chips_added
@@ -738,11 +789,54 @@ class ReceiverLoop:
             else:
                 self.packet_status_text = "Waiting for preamble+sync"
 
-            fw.status.set_text(
-                f"m_f1={m_f1_buf:.3f} | m_f0={m_f0_buf:.3f} | dec={decision_buf:+.3f} | "
-                f"{'LOCKED' if self.ncc_lock else 'searching'} | "
-                f"Carrier={peak_hz:,.0f} Hz | CFO={self.cfo_total_hz:+.1f} Hz | {self.packet_status_text}"
+            if self.header_logs_suppressed_this_frame > 0:
+                print(
+                    f"[RX HEADER] suppressed={self.header_logs_suppressed_this_frame} "
+                    f"(cap={int(config.HEADER_LOGS_PER_FRAME)}/frame)",
+                    flush=True,
+                )
+
+            if config.RENDER_PLOTS:
+                fw.status.set_text(
+                    f"m_f1={m_f1_buf:.3f} | m_f0={m_f0_buf:.3f} | dec={decision_buf:+.3f} | "
+                    f"{'LOCKED' if self.ncc_lock else 'searching'} | "
+                    f"Carrier={peak_hz:,.0f} Hz | CFO={self.cfo_total_hz:+.1f} Hz | {self.packet_status_text}"
+                )
+
+        if config.JITTER_MONITOR_ENABLED:
+            process_elapsed_s = perf_counter() - frame_start_s
+            alpha = 0.10
+            self.rx_time_ema_s = ((1.0 - alpha) * self.rx_time_ema_s) + (alpha * rx_elapsed_s)
+            self.process_time_ema_s = (
+                ((1.0 - alpha) * self.process_time_ema_s) + (alpha * process_elapsed_s)
             )
-            fw.fig.canvas.draw_idle()
+            if frame_gap_s > 0.0:
+                self.frame_gap_ema_s = (
+                    ((1.0 - alpha) * self.frame_gap_ema_s) + (alpha * frame_gap_s)
+                )
+
+            self.max_process_s = max(self.max_process_s, process_elapsed_s)
+            late_budget_s = self.realtime_budget_s * float(config.JITTER_LATE_FACTOR)
+            gap_budget_s = self.realtime_budget_s * float(config.JITTER_GAP_FACTOR)
+            if process_elapsed_s > late_budget_s:
+                self.late_frame_count += 1
+            if frame_gap_s > gap_budget_s:
+                self.gap_slip_count += 1
+
+            if self.frame_index % int(config.JITTER_REPORT_EVERY_FRAMES) == 0:
+                overrun_pct = 100.0 * max(0.0, (process_elapsed_s - self.buffer_duration_s)) / self.buffer_duration_s
+                print(
+                    "[RX JITTER] "
+                    f"frame={self.frame_index} "
+                    f"rx_ms={1000.0 * rx_elapsed_s:.1f} (ema={1000.0 * self.rx_time_ema_s:.1f}) "
+                    f"proc_ms={1000.0 * process_elapsed_s:.1f} (ema={1000.0 * self.process_time_ema_s:.1f}, max={1000.0 * self.max_process_s:.1f}) "
+                    f"gap_ms={(1000.0 * frame_gap_s):.1f} (ema={1000.0 * self.frame_gap_ema_s:.1f}) "
+                    f"budget_ms={1000.0 * self.buffer_duration_s:.1f} "
+                    f"sched_budget_ms={1000.0 * self.realtime_budget_s:.1f} "
+                    f"overrun_pct={overrun_pct:.1f} "
+                    f"late_frames={self.late_frame_count} "
+                    f"gap_slips={self.gap_slip_count}",
+                    flush=True,
+                )
 
         return artists
