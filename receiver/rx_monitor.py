@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Decoupled live monitor for the RX-only FSK loop.
 
 Run in a separate terminal:
-    python -m Receiver_FSK.rx_monitor_fsk
+    python -m receiver.rx_monitor
 """
 
 from __future__ import annotations
@@ -15,12 +15,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-from . import config_fsk as config
-from .packet_decoder_fsk import (
-    bits_to_bytes,
-    bytes_to_bit_list,
+from . import config as config
+from .live_decode import analyze_live_decode
+from .packet_decoder import (
     bits_to_text,
-    majority_decode_triplets,
+    bytes_to_bit_list,
 )
 
 
@@ -33,6 +32,8 @@ class MonitorState:
         self.gap_ms = deque(maxlen=history_len)
         self.cfo_hz = deque(maxlen=history_len)
         self.ncc = deque(maxlen=history_len)
+        self.snr_db: deque[float] = deque(maxlen=history_len)
+        self.locked: bool = False
         self.monitor_axis_khz = np.array([], dtype=np.float64)
         self.monitor_row_dbfs = np.array([], dtype=np.float64)
         self.monitor_waterfall = np.full((config.WATERFALL_ROWS, 1), -140.0, dtype=np.float64)
@@ -41,8 +42,6 @@ class MonitorState:
         self.last_announced_bit: dict[tuple[int, int], int] = {}
         self.last_packet_text = "No live decode yet"
         self.packet_events = deque(maxlen=6)
-        self.logic_tail_bits: list[int] = []
-        self.logic_tail_label = "phase=0 off=0"
         self.packet_bits: list[int] = []
         self.packet_bits_label = "phase=0 off=0"
 
@@ -78,130 +77,17 @@ def _read_new_capture(path: Path, state: MonitorState) -> None:
         state.capture_offset = handle.tell()
 
 
-def _weak_triplet_count(
-    chips: list[int],
-    decode_offset: int,
-    bit_start: int,
-    bit_count: int,
-) -> int:
-    """Count logical bits decided by a weak 2-of-3 majority in a window."""
-    weak = 0
-    step = int(config.REPETITION_CHIPS)
-    for bit_idx in range(bit_start, bit_start + bit_count):
-        chip_start = decode_offset + bit_idx * step
-        chip_end = chip_start + step
-        if chip_end > len(chips):
-            break
-        ones = sum(chips[chip_start:chip_end])
-        if ones not in (0, step):
-            weak += 1
-    return weak
-
-
 def _update_live_decode(state: MonitorState) -> None:
-    header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
-    require_known_payload = bool(config.LIVE_DECODE_REQUIRE_KNOWN_PAYLOAD)
-    expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES) if require_known_payload else []
-    payload_len = (
-        len(expected_payload_bits)
-        if require_known_payload
-        else int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
-    )
-    packet_bits = len(header_bits) + payload_len
+    analysis = analyze_live_decode(state.chips_by_phase, tail_bits=96, include_matches=True)
+    state.last_packet_text = analysis.best_text
+    state.packet_bits = analysis.best_packet_bits
+    state.packet_bits_label = analysis.best_packet_label
 
-    best_text = "No live decode yet"
-    best_score: tuple[int, ...] | None = None
-    best_tail_bits: list[int] = []
-    best_tail_label = "phase=0 off=0"
-    best_packet_bits: list[int] = []
-    best_packet_label = "phase=0 off=0"
-
-    for phase, chips in sorted(state.chips_by_phase.items()):
-        if len(chips) < config.REPETITION_CHIPS * packet_bits:
-            continue
-
-        for decode_offset in range(config.REPETITION_CHIPS):
-            decoded_bits = majority_decode_triplets(chips, decode_offset)
-            if decoded_bits and not best_tail_bits:
-                best_tail_bits = decoded_bits[-96:]
-                best_tail_label = f"phase={phase} off={decode_offset}"
-            if len(decoded_bits) < packet_bits:
-                continue
-
-            recent_start = max(0, len(decoded_bits) - config.LIVE_DECODE_RECENT_BITS)
-            last_start = len(decoded_bits) - packet_bits
-            scan_start = max(0, min(recent_start, last_start))
-            for header_idx in range(scan_start, last_start + 1):
-                header_errors = sum(
-                    1
-                    for left, right in zip(
-                        decoded_bits[header_idx : header_idx + len(header_bits)],
-                        header_bits,
-                    )
-                    if left != right
-                )
-                if header_errors > config.LIVE_DECODE_MAX_HEADER_ERRORS:
-                    continue
-
-                payload_start = header_idx + len(header_bits)
-                payload_end = payload_start + payload_len
-                payload_bits = decoded_bits[payload_start:payload_end]
-                payload = bits_to_bytes(payload_bits)
-                recency = len(decoded_bits) - payload_end
-                weak_bits = _weak_triplet_count(
-                    chips,
-                    decode_offset,
-                    header_idx,
-                    len(header_bits) + payload_len,
-                )
-                if weak_bits > int(config.LIVE_DECODE_MAX_WEAK_BITS):
-                    continue
-
-                if require_known_payload:
-                    payload_errors_normal = sum(
-                        1 for left, right in zip(payload_bits, expected_payload_bits) if left != right
-                    )
-                    if config.ALLOW_INVERTED_PAYLOAD_MATCH:
-                        payload_errors_inverted = sum(
-                            1 for left, right in zip(payload_bits, expected_payload_bits) if (1 - left) != right
-                        )
-                    else:
-                        payload_errors_inverted = payload_errors_normal
-                    payload_errors = min(payload_errors_normal, payload_errors_inverted)
-                    if payload_errors > config.LIVE_DECODE_MAX_PAYLOAD_ERRORS:
-                        continue
-                    polarity = "inverted" if payload_errors_inverted < payload_errors_normal else "normal"
-                    score = (payload_errors, header_errors, weak_bits, recency)
-                    text = (
-                        f"phase={phase} off={decode_offset} bit={header_idx} "
-                        f"herr={header_errors} perr={payload_errors} weak={weak_bits} payload={payload.hex().upper()} {payload!r} {polarity}"
-                    )
-                else:
-                    score = (header_errors, weak_bits, recency)
-                    text = (
-                        f"phase={phase} off={decode_offset} bit={header_idx} "
-                        f"herr={header_errors} weak={weak_bits} payload={payload.hex().upper()} {payload!r} unknown"
-                    )
-
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_text = text
-                    best_tail_bits = decoded_bits[-96:]
-                    best_tail_label = f"phase={phase} off={decode_offset}"
-                    best_packet_bits = decoded_bits[header_idx:payload_end]
-                    best_packet_label = f"phase={phase} off={decode_offset} bit={header_idx}"
-
-                key = (phase, decode_offset)
-                matched = (payload_errors == 0 and header_errors == 0) if require_known_payload else (header_errors == 0)
-                if matched and header_idx > state.last_announced_bit.get(key, -1):
-                    state.last_announced_bit[key] = header_idx
-                    state.packet_events.appendleft(f"PKT phase={phase} off={decode_offset} bit={header_idx}")
-
-    state.last_packet_text = best_text
-    state.logic_tail_bits = best_tail_bits
-    state.logic_tail_label = best_tail_label
-    state.packet_bits = best_packet_bits
-    state.packet_bits_label = best_packet_label
+    for phase, decode_offset, header_idx in analysis.matches:
+        key = (phase, decode_offset)
+        if header_idx > state.last_announced_bit.get(key, -1):
+            state.last_announced_bit[key] = header_idx
+            state.packet_events.appendleft(f"PKT phase={phase} off={decode_offset} bit={header_idx}")
 
 
 def main() -> int:
@@ -219,10 +105,12 @@ def main() -> int:
     state.monitor_row_dbfs = np.full_like(default_axis_khz, -140.0)
     state.monitor_waterfall = np.full((config.WATERFALL_ROWS, default_axis_khz.size), -140.0, dtype=np.float64)
 
-    fig, (ax_centered, ax_waterfall, ax_bits) = plt.subplots(3, 1, figsize=(11, 9))
-    fig.subplots_adjust(top=0.92, bottom=0.14, hspace=0.62)
+    fig, (ax_centered, ax_waterfall, ax_quality, ax_bits) = plt.subplots(
+        4, 1, figsize=(11, 11), gridspec_kw={"height_ratios": [2, 2.5, 1.5, 1.5]}
+    )
+    fig.subplots_adjust(top=0.93, bottom=0.10, hspace=0.82)
     fig.canvas.manager.set_window_title("FSK RX Monitor")
-    fig.suptitle("FSK RX Monitor — decoupled spectrum, waterfall, and live decode")
+    fig.suptitle("FSK RX Monitor \u2014 spectrum \u00b7 waterfall \u00b7 signal quality \u00b7 decode")
 
     (line_centered,) = ax_centered.plot(default_axis_khz, state.monitor_row_dbfs, lw=1.2, color="C0")
     ax_centered.axvline(0.0, color="C3", lw=1.0, alpha=0.8)
@@ -253,11 +141,42 @@ def main() -> int:
     ax_waterfall.axvline(config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.8, alpha=0.6, linestyle="--")
     ax_waterfall.axvline(-config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.8, alpha=0.6, linestyle="--")
 
-    packet_bit_count = len(bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)) + int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
+    # ---- Signal quality panel (SNR + CFO rolling history) ------------------
+    (line_snr,) = ax_quality.plot([], [], lw=1.4, color="C0", label="SNR dB")
+    ax_quality.axhline(
+        config.SNR_LOCK_THRESHOLD_DB, color="lime", lw=0.9, ls="--", alpha=0.8,
+        label=f"lock thr {config.SNR_LOCK_THRESHOLD_DB:.0f} dB",
+    )
+    ax_quality.set_ylabel("Sideband SNR (dB)", color="C0", fontsize=8)
+    ax_quality.tick_params(axis="y", labelcolor="C0", labelsize=7)
+    ax_quality.set_xlim(0, state.history_len)
+    ax_quality.set_ylim(-5.0, max(40.0, config.SNR_LOCK_THRESHOLD_DB + 15.0))
+    ax_quality.set_title("Signal Quality & CFO", pad=6, fontsize=9)
+    ax_quality.grid(True, alpha=0.3)
+    ax_cfo = ax_quality.twinx()
+    (line_cfo,) = ax_cfo.plot([], [], lw=1.0, color="C1", alpha=0.85, label="CFO Hz")
+    ax_cfo.axhline(0.0, color="0.6", lw=0.5, ls=":")
+    ax_cfo.set_ylim(-600.0, 600.0)
+    ax_cfo.set_ylabel("CFO (Hz)", color="C1", fontsize=8)
+    ax_cfo.tick_params(axis="y", labelcolor="C1", labelsize=7)
+
+    packet_bit_count = len(bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)) + 8 + int(config.LIVE_DECODE_MAX_PAYLOAD_BYTES) * 8
     bit_axis = np.arange(packet_bit_count, dtype=np.float64)
+    _preamble_bits = len(bytes_to_bit_list(config.PREAMBLE_BYTES))
+    _header_bits = len(bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES))
+    _len_field_end = _header_bits + 8
     (line_bits,) = ax_bits.step(bit_axis, np.zeros_like(bit_axis), where="mid", lw=1.2, color="C3")
-    ax_bits.axvline(len(bytes_to_bit_list(config.PREAMBLE_BYTES)), color="0.5", lw=0.8, alpha=0.6)
-    ax_bits.axvline(len(bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)), color="0.5", lw=0.8, alpha=0.6)
+    ax_bits.axvspan(0, _preamble_bits, color="C0", alpha=0.09)
+    ax_bits.axvspan(_preamble_bits, _header_bits, color="C2", alpha=0.09)
+    ax_bits.axvspan(_header_bits, _len_field_end, color="C5", alpha=0.12)
+    ax_bits.axvspan(_len_field_end, packet_bit_count, color="C3", alpha=0.06)
+    ax_bits.axvline(_preamble_bits, color="0.5", lw=0.8, alpha=0.6)
+    ax_bits.axvline(_header_bits, color="0.5", lw=0.8, alpha=0.6)
+    ax_bits.axvline(_len_field_end, color="0.5", lw=0.8, alpha=0.6)
+    ax_bits.text(_preamble_bits / 2, 1.06, "pre", ha="center", va="bottom", fontsize=7, color="0.5", transform=ax_bits.get_xaxis_transform())
+    ax_bits.text((_preamble_bits + _header_bits) / 2, 1.06, "sync", ha="center", va="bottom", fontsize=7, color="0.5", transform=ax_bits.get_xaxis_transform())
+    ax_bits.text((_header_bits + _len_field_end) / 2, 1.06, "len", ha="center", va="bottom", fontsize=7, color="0.5", transform=ax_bits.get_xaxis_transform())
+    ax_bits.text((_len_field_end + packet_bit_count) / 2, 1.06, "payload", ha="center", va="bottom", fontsize=7, color="0.5", transform=ax_bits.get_xaxis_transform())
     ax_bits.set_title("Best Decoded Packet Bits", pad=10)
     ax_bits.set_xlabel("Packet bit index")
     ax_bits.set_ylabel("Bit")
@@ -286,14 +205,8 @@ def main() -> int:
         state.cfo_hz.append(float(status.get("cfo_hz", 0.0)))
         state.ncc.append(float(status.get("ncc_ema", 0.0)))
 
-        axis_vals = np.asarray(status.get("monitor_axis_khz", []), dtype=np.float64)
         row_vals = np.asarray(status.get("monitor_row_dbfs", []), dtype=np.float64)
-        if axis_vals.size and row_vals.size and axis_vals.size == row_vals.size:
-            if axis_vals.size != state.monitor_axis_khz.size:
-                state.monitor_waterfall = np.full((config.WATERFALL_ROWS, axis_vals.size), -140.0, dtype=np.float64)
-                ax_centered.set_xlim(float(axis_vals[0]), float(axis_vals[-1]))
-                waterfall_img.set_extent([float(axis_vals[0]), float(axis_vals[-1]), 0, config.WATERFALL_ROWS])
-            state.monitor_axis_khz = axis_vals
+        if row_vals.size == state.monitor_axis_khz.size:
             state.monitor_row_dbfs = row_vals
             line_centered.set_data(state.monitor_axis_khz, state.monitor_row_dbfs)
 
@@ -317,9 +230,28 @@ def main() -> int:
                 nf = float(np.percentile(valid, 15))
                 waterfall_img.set_clim(vmin=nf - 1.0, vmax=nf + config.WATERFALL_DYN_RANGE_DB)
 
-        lock_text = "LOCK" if int(status.get("lock", 0)) else "SEARCH"
+        locked = bool(int(status.get("lock", 0)))
+        state.locked = locked
+        lock_text = "LOCK" if locked else "SEARCH"
         late = status.get("late_frames")
         slips = status.get("gap_slips")
+
+        # ---- Update signal quality panel -----------------------------------
+        snr_val = float(status.get("monitor_sideband_snr_db", 0.0))
+        state.snr_db.append(snr_val)
+        n_pts = len(state.snr_db)
+        if n_pts >= 2:
+            xq = np.arange(n_pts, dtype=np.float64)
+            line_snr.set_data(xq, np.asarray(state.snr_db, dtype=np.float64))
+            line_cfo.set_data(xq, np.asarray(state.cfo_hz, dtype=np.float64))
+            ax_quality.set_xlim(0, max(n_pts - 1, 1))
+            ax_cfo.set_xlim(0, max(n_pts - 1, 1))
+            snr_arr = np.asarray(state.snr_db, dtype=np.float64)
+            ax_quality.set_ylim(
+                min(-5.0, float(np.min(snr_arr)) - 2.0),
+                max(float(np.max(snr_arr)) + 4.0, config.SNR_LOCK_THRESHOLD_DB + 5.0),
+            )
+        ax_quality.set_facecolor("#e8f5e9" if locked else "#fff8e1")
 
         packet_bits = state.packet_bits
         if packet_bits:
@@ -330,22 +262,22 @@ def main() -> int:
             bits_text.set_text(
                 f"{state.packet_bits_label}\n"
                 f"bits={bits_to_text(packet_bits)}\n"
-                f"packet={config.PREAMBLE_BYTES.hex().upper()} {config.SYNC_BYTES.hex().upper()} + {config.LIVE_DECODE_PAYLOAD_BYTES}B"
+                f"packet={config.PREAMBLE_BYTES.hex().upper()} {config.SYNC_BYTES.hex().upper()} [len] payload"
             )
         else:
             line_bits.set_data([0.0], [0.0])
             bits_text.set_text("Waiting for decoded packet...")
 
         events_text = " | ".join(state.packet_events) if state.packet_events else "No recent packet match"
-        snr_db = status.get("monitor_sideband_snr_db")
         sb_pos = status.get("monitor_sideband_pos_dbfs")
         sb_neg = status.get("monitor_sideband_neg_dbfs")
         decode_summary = status.get("decode_summary") or state.last_packet_text
 
+        status_text.set_color("#1b5e20" if locked else "#e65100")
         status_text.set_text(
             f"frame={status.get('frame')}  {lock_text}  phase={status.get('best_phase')}  chips={status.get('chips_seen')}  "
             f"peak={status.get('peak_hz')} Hz  CFO={status.get('cfo_hz')} Hz  NCC={status.get('ncc_ema')}  late={late}  slips={slips}\n"
-            f"sidebands: snr={snr_db} dB  +1k={sb_pos} dBFS  -1k={sb_neg} dBFS  rx/proc/gap={status.get('rx_ms')}/{status.get('proc_ms')}/{status.get('gap_ms')} ms\n"
+            f"sidebands: snr={snr_val:.1f} dB  +1k={sb_pos} dBFS  -1k={sb_neg} dBFS  rx/proc/gap={status.get('rx_ms')}/{status.get('proc_ms')}/{status.get('gap_ms')} ms\n"
             f"best_decode={decode_summary}\n"
             f"events={events_text}"
         )
@@ -359,3 +291,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

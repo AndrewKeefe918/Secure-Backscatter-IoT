@@ -1,4 +1,4 @@
-"""RX-only lightweight loop for ingest/slicing/capture.
+﻿"""RX-only lightweight loop for ingest/slicing/capture.
 
 This module intentionally avoids packet decoding and plotting so the realtime
 path stays minimal. Heavy packet search runs offline on the captured chip stream.
@@ -13,8 +13,8 @@ from time import perf_counter
 
 import numpy as np
 
-from . import config_fsk as config
-from .dsp_fsk import (
+from . import config as config
+from .dsp import (
     bandpass_filter_around_carrier,
     coherent_fsk_metrics,
     compute_spectrum_dbfs,
@@ -28,12 +28,8 @@ from .dsp_fsk import (
     remap_and_compress_centered,
     smooth_1d,
 )
-from .packet_decoder_fsk import bits_to_text
-from .packet_decoder_fsk import (
-    bits_to_bytes,
-    bytes_to_bit_list,
-    majority_decode_triplets,
-)
+from .live_decode import analyze_live_decode
+from .packet_decoder import bits_to_text
 
 
 @dataclass
@@ -170,120 +166,11 @@ class ReceiverLoopRxOnly:
         }
         self.capture_file.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
-    def _weak_triplet_count(
-        self,
-        chips: list[int],
-        decode_offset: int,
-        bit_start: int,
-        bit_count: int,
-    ) -> int:
-        """Count logical bits decided by a weak 2-of-3 majority in a window."""
-        weak = 0
-        step = int(config.REPETITION_CHIPS)
-        for bit_idx in range(bit_start, bit_start + bit_count):
-            chip_start = decode_offset + bit_idx * step
-            chip_end = chip_start + step
-            if chip_end > len(chips):
-                break
-            ones = sum(chips[chip_start:chip_end])
-            if ones not in (0, step):
-                weak += 1
-        return weak
-
     def _update_live_decode_summary(self) -> None:
-        header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
-        require_known_payload = bool(config.LIVE_DECODE_REQUIRE_KNOWN_PAYLOAD)
-        expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES) if require_known_payload else []
-        payload_len = (
-            len(expected_payload_bits)
-            if require_known_payload
-            else int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
-        )
-        packet_bits = len(header_bits) + payload_len
-
-        best_text = "No live decode yet"
-        best_score: tuple[int, ...] | None = None
-        best_logic_tail = ""
-
-        for phase, state in sorted(self.phase_state.items()):
-            chips = state.chips
-            if len(chips) < config.REPETITION_CHIPS * packet_bits:
-                continue
-
-            for decode_offset in range(config.REPETITION_CHIPS):
-                decoded_bits = majority_decode_triplets(chips, decode_offset)
-                if not decoded_bits:
-                    continue
-
-                logic_tail = bits_to_text(decoded_bits[-48:])
-                if best_logic_tail == "":
-                    best_logic_tail = logic_tail
-
-                if len(decoded_bits) < packet_bits:
-                    continue
-
-                recent_start = max(0, len(decoded_bits) - config.LIVE_DECODE_RECENT_BITS)
-                last_start = len(decoded_bits) - packet_bits
-                scan_start = max(0, min(recent_start, last_start))
-                for header_idx in range(scan_start, last_start + 1):
-                    header_errors = sum(
-                        1
-                        for left, right in zip(
-                            decoded_bits[header_idx : header_idx + len(header_bits)],
-                            header_bits,
-                        )
-                        if left != right
-                    )
-                    if header_errors > config.LIVE_DECODE_MAX_HEADER_ERRORS:
-                        continue
-
-                    payload_start = header_idx + len(header_bits)
-                    payload_end = payload_start + payload_len
-                    payload_bits = decoded_bits[payload_start:payload_end]
-                    payload = bits_to_bytes(payload_bits)
-                    recency = len(decoded_bits) - payload_end
-                    weak_bits = self._weak_triplet_count(
-                        chips,
-                        decode_offset,
-                        header_idx,
-                        len(header_bits) + payload_len,
-                    )
-                    if weak_bits > int(config.LIVE_DECODE_MAX_WEAK_BITS):
-                        continue
-
-                    if require_known_payload:
-                        payload_errors_normal = sum(
-                            1 for left, right in zip(payload_bits, expected_payload_bits) if left != right
-                        )
-                        if config.ALLOW_INVERTED_PAYLOAD_MATCH:
-                            payload_errors_inverted = sum(
-                                1 for left, right in zip(payload_bits, expected_payload_bits) if (1 - left) != right
-                            )
-                        else:
-                            payload_errors_inverted = payload_errors_normal
-                        payload_errors = min(payload_errors_normal, payload_errors_inverted)
-                        if payload_errors > config.LIVE_DECODE_MAX_PAYLOAD_ERRORS:
-                            continue
-                        polarity = "inverted" if payload_errors_inverted < payload_errors_normal else "normal"
-                        score = (payload_errors, header_errors, weak_bits, recency)
-                        text = (
-                            f"phase={phase} off={decode_offset} bit={header_idx} herr={header_errors} "
-                            f"perr={payload_errors} weak={weak_bits} payload={payload.hex().upper()} {payload!r} {polarity}"
-                        )
-                    else:
-                        score = (header_errors, weak_bits, recency)
-                        text = (
-                            f"phase={phase} off={decode_offset} bit={header_idx} herr={header_errors} "
-                            f"weak={weak_bits} payload={payload.hex().upper()} {payload!r} unknown"
-                        )
-
-                    if best_score is None or score < best_score:
-                        best_score = score
-                        best_text = text
-                        best_logic_tail = logic_tail
-
-        self.last_decode_summary = best_text
-        self.last_logic_tail = best_logic_tail
+        chips_by_phase = {phase: state.chips for phase, state in self.phase_state.items()}
+        analysis = analyze_live_decode(chips_by_phase, tail_bits=48, include_matches=False)
+        self.last_decode_summary = analysis.best_text
+        self.last_logic_tail = bits_to_text(analysis.best_tail_bits) if analysis.best_tail_bits else ""
 
     def _emit_status(self, peak_hz: float) -> None:
         if self.frame_index % max(1, int(config.RX_TERMINAL_STATUS_EVERY_FRAMES)) != 0:
@@ -350,7 +237,6 @@ class ReceiverLoopRxOnly:
             "budget_ms": round(1000.0 * self.realtime_budget_s, 3),
             "late_frames": int(self.late_frame_count),
             "gap_slips": int(self.gap_slip_count),
-            "monitor_axis_khz": [round(float(v), 3) for v in self.monitor_axis_khz],
             "monitor_row_dbfs": [round(float(v), 2) for v in self.monitor_centered_row],
             "monitor_noise_floor_dbfs": round(float(self.monitor_noise_floor_dbfs), 2),
             "monitor_sideband_snr_db": round(float(self.monitor_sideband_snr_db), 2),
@@ -494,3 +380,4 @@ class ReceiverLoopRxOnly:
         self._emit_status(peak_hz)
 
         return tuple()
+

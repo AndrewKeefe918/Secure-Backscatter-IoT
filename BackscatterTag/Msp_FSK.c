@@ -26,7 +26,7 @@
  * signal power, never has to distinguish "signal present" from "noise."
  */
 
-#define PACKET_LENGTH               6U
+#define PACKET_LENGTH               9U   /* AA + 7E + len(1) + 6 payload */
 #define BIT_DURATION_MS             50U
 
 /* CCR0 values for the two subcarrier frequencies.
@@ -49,7 +49,7 @@
  * making packet-edge detection easier. */
 #define GAP_BETWEEN_PACKETS_MS      2000U
 
-const uint8_t packet[PACKET_LENGTH] = { 0xAA, 0x7E, 'O', 'P', 'E', 'N' };
+const uint8_t packet[PACKET_LENGTH] = { 0xAA, 0x7E, 6, 'H', 'E', 'L', 'P', 'E', 'R' };
 
 /* Block for N CCR0 events. Each tick = (CCR0+1) * 1us at 1 MHz SMCLK. */
 static void wait_subcarrier_ticks(uint16_t ticks) {

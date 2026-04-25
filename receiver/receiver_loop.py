@@ -1,4 +1,4 @@
-"""ReceiverLoop — per-frame state and FuncAnimation callback (FSK version).
+﻿"""ReceiverLoop â€” per-frame state and FuncAnimation callback (FSK version).
 
 Differences from OOK ReceiverLoop:
   - Chip decisions use coherent_fsk_metrics() comparing m_f1 vs m_f0,
@@ -16,8 +16,8 @@ from time import perf_counter
 
 import numpy as np
 
-from . import config_fsk as config
-from .dsp_fsk import (
+from . import config as config
+from .dsp import (
     normalize_iq,
     dc_block_filter,
     compute_spectrum_dbfs,
@@ -31,7 +31,7 @@ from .dsp_fsk import (
     remap_and_compress_centered,
     smooth_1d,
 )
-from .packet_decoder_fsk import (
+from .packet_decoder import (
     bytes_to_bit_list,
     bits_to_bytes,
     find_header_match,
@@ -39,7 +39,7 @@ from .packet_decoder_fsk import (
     bits_to_text,
     safe_ascii,
 )
-from .gui_setup_fsk import BasebandWindow, CarrierWindow, FskWindow
+from .gui_setup import BasebandWindow, CarrierWindow, FskWindow
 
 
 @dataclass
@@ -475,8 +475,8 @@ class ReceiverLoop:
                 f"Carrier-DC={dc_to_carrier_db:.1f} dB"
             )
             cw.status.set_text(
-                f"Carrier={peak_hz:,.1f} Hz | Span=±{config.CENTERED_SPAN_HZ/1000.0:.0f} kHz | "
-                f"SB SNR={snr_db:+.1f} dB at ±{config.SIDEBAND_OFFSET_KHZ:.1f} kHz "
+                f"Carrier={peak_hz:,.1f} Hz | Span=Â±{config.CENTERED_SPAN_HZ/1000.0:.0f} kHz | "
+                f"SB SNR={snr_db:+.1f} dB at Â±{config.SIDEBAND_OFFSET_KHZ:.1f} kHz "
                 f"(+={sb_pos:.1f} -={sb_neg:.1f} Noise={noise_floor_sb:.1f} dBFS)"
             )
 
@@ -576,3 +576,4 @@ class ReceiverLoop:
                 )
 
         return artists
+

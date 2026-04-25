@@ -1,10 +1,10 @@
-"""Bit-level and packet decoding utilities — FSK version.
+﻿"""Bit-level and packet decoding utilities â€” FSK version.
 
 Identical algorithms to the OOK packet_decoder; only the module
-import changes (config_fsk instead of config).
+import changes (config instead of config).
 """
 
-from . import config_fsk as config
+from . import config as config
 
 
 def bytes_to_bit_list(data: bytes) -> list[int]:
@@ -78,7 +78,7 @@ def safe_ascii(data: bytes) -> str:
 def majority_decode_triplets(chips: list[int], start_offset: int) -> list[int]:
     """Collapse `REPETITION_CHIPS` consecutive chips into one bit by majority vote.
 
-    With REPETITION_CHIPS = 1 (the FSK default) this is a passthrough — no
+    With REPETITION_CHIPS = 1 (the FSK default) this is a passthrough â€” no
     voting happens, each chip is one bit. With higher values the same
     majority rule used by the OOK decoder applies.
     """
@@ -89,3 +89,4 @@ def majority_decode_triplets(chips: list[int], start_offset: int) -> list[int]:
         decoded.append(1 if sum(triplet) >= config.MAJORITY_ONES_THRESHOLD else 0)
         idx += config.REPETITION_CHIPS
     return decoded
+

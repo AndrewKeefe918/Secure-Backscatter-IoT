@@ -1,7 +1,10 @@
-"""Matplotlib figure and artist initialisation for the receiver GUI.
+﻿"""Matplotlib figure and artist initialisation for the receiver GUI â€” FSK version.
 
-Each setup_* function builds one window and returns a dataclass holding
-all the artist handles needed by ReceiverRuntime.update().
+Difference from the OOK GUI:
+  - The carrier-detail spectrum and waterfall both show TWO subcarrier
+    markers (1 kHz for '1' bits, 1.7 kHz for '0' bits).
+  - The chip-decision panel plots BOTH metrics m_f1 and m_f0 in addition
+    to the per-chip decision, so visual inspection is easy.
 """
 
 from dataclasses import dataclass
@@ -10,11 +13,11 @@ from typing import Any
 import numpy as np
 import matplotlib.pyplot as plt
 
-from . import config
+from . import config as config
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses — typed containers for plot handles passed to ReceiverRuntime
+# Dataclasses â€” typed containers for plot handles passed to ReceiverLoop
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -26,12 +29,6 @@ class BasebandWindow:
     line_fft_dc_blocked: Any
     exciter_marker: Any
     status: Any
-    ax_iq: Any
-    iq_scatter: Any           # recent raw IQ samples (subsampled)
-    tuning_circle: Any        # Line2D — carrier-locus circle (Satori reference)
-    triangle_line: Any        # Line2D — closed triangle: carrier + ±1 kHz sideband phasors
-    triangle_vertices: Any    # PathCollection — 3 dots at triangle vertices
-    iq_centroid: Any          # PathCollection — single centroid marker
 
 
 @dataclass
@@ -41,24 +38,33 @@ class CarrierWindow:
     line_centered: Any
     waterfall_img: Any
     waterfall_data: np.ndarray
-    centered_axis: np.ndarray   # reused by ReceiverRuntime for interpolation / masking
+    centered_axis: np.ndarray
     sideband_scatter: Any
     snr_threshold_line: Any
     status: Any
 
 
 @dataclass
-class NccWindow:
+class FskWindow:
+    """Replaces the NCC window from the OOK build.
+
+    Top panel: rolling history of m_f1, m_f0, and the decision metric.
+    Bottom panel: per-chip decisions over time with the two metric traces.
+    """
     fig: Any
-    ax_ncc: Any
-    ax_env: Any
-    line_ncc: Any
-    line_env: Any
-    line_env_bits: Any
-    env_threshold_line: Any
-    ncc_status: Any
-    ncc_history: np.ndarray
-    env_plot_len: int
+    ax_metrics: Any
+    ax_chips: Any
+    line_m_f1: Any
+    line_m_f0: Any
+    line_decision: Any
+    line_chip_decision: Any
+    line_chip_m_f1: Any
+    line_chip_m_f0: Any
+    status: Any
+    metric_history_f1: np.ndarray
+    metric_history_f0: np.ndarray
+    metric_history_decision: np.ndarray
+    chip_history_len: int
 
 
 # ---------------------------------------------------------------------------
@@ -66,21 +72,10 @@ class NccWindow:
 # ---------------------------------------------------------------------------
 
 def setup_baseband_window() -> BasebandWindow:
-    """Create the baseband window: time domain + IQ plane (top), spectrum (bottom).
-
-    The IQ panel shows a Satori-style tuning circle (carrier-locus) and the
-    “tuning triangle” formed by the reference (carrier) phasor and the two
-    ±1 kHz backscatter sideband phasors — the three points whose geometry
-    Satori uses to recover residual CFO and pilot weighting.
-    """
-    fig = plt.figure(figsize=(13, 7))
-    fig.canvas.manager.set_window_title("Pluto Baseband Receiver")
-    fig.suptitle("PlutoSDR Raw Baseband View")
-
-    gs = fig.add_gridspec(2, 3, width_ratios=[2, 2, 1.6], height_ratios=[1, 1])
-    ax_time = fig.add_subplot(gs[0, 0:2])
-    ax_iq = fig.add_subplot(gs[0, 2])
-    ax_fft = fig.add_subplot(gs[1, :])
+    """Time-domain + wide-spectrum view (unchanged from OOK)."""
+    fig, (ax_time, ax_fft) = plt.subplots(2, 1, figsize=(11, 7))
+    fig.canvas.manager.set_window_title("Pluto Baseband Receiver â€” FSK")
+    fig.suptitle("PlutoSDR Raw Baseband View (FSK Mode)")
 
     time_axis = np.arange(config.TIME_SAMPLES)
     (line_i,) = ax_time.plot(time_axis, np.zeros(config.TIME_SAMPLES), label="I", lw=1.0)
@@ -88,76 +83,27 @@ def setup_baseband_window() -> BasebandWindow:
     ax_time.set_title("Time Domain (first samples)")
     ax_time.set_xlabel("Sample")
     ax_time.set_ylabel("Amplitude (normalized)")
-    ax_time.set_ylim(-config.TIME_PLOT_Y_LIMIT, config.TIME_PLOT_Y_LIMIT)
+    ax_time.set_ylim(-1.1, 1.1)
     ax_time.grid(True, alpha=0.3)
     ax_time.legend(loc="upper right")
 
     fft_axis = np.linspace(
-        -config.SPECTRUM_SPAN_HZ / 1000.0,
-        config.SPECTRUM_SPAN_HZ / 1000.0,
-        config.BASEBAND_FFT_BINS,
+        -config.SPECTRUM_SPAN_HZ / 1000.0, config.SPECTRUM_SPAN_HZ / 1000.0, 512
     )
     (line_fft_raw,) = ax_fft.plot(
-        fft_axis,
-        np.full_like(fft_axis, config.DBFS_FLOOR),
-        lw=0.9,
-        color="0.65",
-        label="Raw spectrum",
+        fft_axis, np.full_like(fft_axis, -140.0), lw=0.9, color="0.65", label="Raw spectrum",
     )
     (line_fft_dc_blocked,) = ax_fft.plot(
-        fft_axis,
-        np.full_like(fft_axis, config.DBFS_FLOOR),
-        lw=1.2,
-        color="C0",
-        label="Processed spectrum",
+        fft_axis, np.full_like(fft_axis, -140.0), lw=1.2, color="C0", label="Processed spectrum",
     )
     exciter_marker = ax_fft.axvline(0.0, color="C3", lw=1.0, alpha=0.8, label="Exciter peak")
     ax_fft.axvline(0.0, color="0.3", lw=0.8, alpha=0.35, linestyle="--")
     ax_fft.set_title("Spectrum Near Baseband")
     ax_fft.set_xlabel("Frequency Offset (kHz)")
     ax_fft.set_ylabel("Magnitude (dBFS)")
-    ax_fft.set_ylim(config.DBFS_FLOOR, config.BASEBAND_FFT_YMAX_DBFS)
+    ax_fft.set_ylim(-140.0, 5.0)
     ax_fft.grid(True, alpha=0.3)
     ax_fft.legend(loc="lower left")
-
-    # ---- IQ-plane panel: tuning circle + Satori triangle -----------------
-    ax_iq.set_title("IQ Plane — Tuning Circle & Satori Triangle")
-    ax_iq.set_xlabel("I")
-    ax_iq.set_ylabel("Q")
-    ax_iq.set_aspect("equal", adjustable="box")
-    ax_iq.grid(True, alpha=0.3)
-    ax_iq.axhline(0.0, color="0.5", lw=0.6, alpha=0.5)
-    ax_iq.axvline(0.0, color="0.5", lw=0.6, alpha=0.5)
-    ax_iq.set_xlim(-1.0, 1.0)
-    ax_iq.set_ylim(-1.0, 1.0)
-
-    # Subsampled raw IQ scatter (gray cloud).
-    iq_scatter = ax_iq.scatter(
-        np.zeros(1), np.zeros(1),
-        s=4, c="#888888", alpha=0.35, label="IQ samples",
-    )
-    # Tuning circle — Satori reference: carrier-locus where the reference symbol lives.
-    theta = np.linspace(0.0, 2.0 * np.pi, 256)
-    (tuning_circle,) = ax_iq.plot(
-        np.cos(theta), np.sin(theta),
-        color="C0", lw=1.2, alpha=0.85, label="Tuning circle (carrier)",
-    )
-    # Triangle: 3 vertices = carrier phasor, +1 kHz SB phasor, -1 kHz SB phasor.
-    (triangle_line,) = ax_iq.plot(
-        [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0],
-        color="C3", lw=1.4, alpha=0.9, label="Tuning triangle",
-    )
-    triangle_vertices = ax_iq.scatter(
-        [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
-        s=55, c=["#ffaa00", "#44ff88", "#44aaff"],
-        edgecolors="black", linewidths=0.6, zorder=5,
-        label="ref / +SB / -SB",
-    )
-    iq_centroid = ax_iq.scatter(
-        [0.0], [0.0], s=30, facecolors="none", edgecolors="black",
-        linewidths=0.9, marker="o", zorder=6,
-    )
-    ax_iq.legend(loc="upper right", fontsize=7)
 
     status = fig.text(0.01, 0.01, "Connecting...", ha="left", va="bottom")
 
@@ -169,54 +115,59 @@ def setup_baseband_window() -> BasebandWindow:
         line_fft_dc_blocked=line_fft_dc_blocked,
         exciter_marker=exciter_marker,
         status=status,
-        ax_iq=ax_iq,
-        iq_scatter=iq_scatter,
-        tuning_circle=tuning_circle,
-        triangle_line=triangle_line,
-        triangle_vertices=triangle_vertices,
-        iq_centroid=iq_centroid,
     )
 
 
 def setup_carrier_window() -> CarrierWindow:
-    """Create the two-panel carrier-detail window (centered spectrum + waterfall)."""
+    """Carrier-centered spectrum + waterfall, with markers for BOTH FSK frequencies."""
     carrier_fig, (ax_centered, ax_waterfall) = plt.subplots(2, 1, figsize=(10, 7))
-    carrier_fig.canvas.manager.set_window_title("Pluto Carrier Detail")
-    carrier_fig.suptitle("Auto-Centered Carrier View")
+    carrier_fig.canvas.manager.set_window_title("Pluto Carrier Detail â€” FSK")
+    carrier_fig.suptitle(
+        f"Auto-Centered Carrier â€” FSK markers at "
+        f"{config.FSK_F1_HZ/1000:.1f} kHz ('1') and {config.FSK_F0_HZ/1000:.1f} kHz ('0')"
+    )
 
     centered_axis = np.linspace(
         -config.CENTERED_SPAN_HZ / 1000.0, config.CENTERED_SPAN_HZ / 1000.0, config.WATERFALL_BINS
     )
     (line_centered,) = ax_centered.plot(
-        centered_axis, np.full_like(centered_axis, config.DBFS_FLOOR), lw=1.2, color="C0",
+        centered_axis, np.full_like(centered_axis, -140.0), lw=1.2, color="C0",
     )
     ax_centered.axvline(0.0, color="C3", lw=1.0, alpha=0.8)
+
+    # Markers for the '1' frequency (1 kHz)
     ax_centered.axvline(
         config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.9, alpha=0.7,
-        linestyle="--", label="±1 kHz SB",
+        linestyle="--", label=f"Â±{config.FSK_F1_HZ/1000:.1f} kHz ('1')",
     )
     ax_centered.axvline(-config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.9, alpha=0.7, linestyle="--")
+    # Markers for the '0' frequency (1.7 kHz)
+    ax_centered.axvline(
+        config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.9, alpha=0.7,
+        linestyle="--", label=f"Â±{config.FSK_F0_HZ/1000:.1f} kHz ('0')",
+    )
+    ax_centered.axvline(-config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.9, alpha=0.7, linestyle="--")
     ax_centered.set_title("Carrier-Centered Spectrum")
     ax_centered.set_xlabel("Offset From Carrier (kHz)")
     ax_centered.set_ylabel("Magnitude (dBFS)")
-    ax_centered.set_ylim(config.CARRIER_VIEW_YMIN_DBFS, config.CARRIER_VIEW_YMAX_DBFS)
+    ax_centered.set_ylim(-120.0, -60.0)
     ax_centered.grid(True, alpha=0.3)
 
     sideband_scatter = ax_centered.scatter(
         [-config.SIDEBAND_OFFSET_KHZ, config.SIDEBAND_OFFSET_KHZ],
-        [config.DBFS_FLOOR, config.DBFS_FLOOR],
+        [-140.0, -140.0],
         c=["#ff4444", "#ff4444"], s=80, zorder=5,
         marker="D", edgecolors="white", linewidths=0.8,
-        label="SB peaks",
+        label="'1' SB peaks",
     )
     snr_threshold_line = ax_centered.axhline(
-        config.DBFS_FLOOR, color="#ff4444", lw=1.0, linestyle=":", alpha=0.85,
+        -140.0, color="#ff4444", lw=1.0, linestyle=":", alpha=0.85,
         label=f"SNR={config.SNR_LOCK_THRESHOLD_DB:.0f}dB target",
     )
-    ax_centered.legend(loc="upper left", fontsize=8)
+    ax_centered.legend(loc="upper left", fontsize=7)
 
     waterfall_data = np.full(
-        (config.WATERFALL_ROWS, centered_axis.size), config.DBFS_FLOOR, dtype=np.float64
+        (config.WATERFALL_ROWS, centered_axis.size), -140.0, dtype=np.float64
     )
     waterfall_img = ax_waterfall.imshow(
         waterfall_data,
@@ -224,14 +175,17 @@ def setup_carrier_window() -> CarrierWindow:
         origin="lower",
         extent=[centered_axis[0], centered_axis[-1], 0, config.WATERFALL_ROWS],
         cmap="plasma",
-        vmin=config.DBFS_FLOOR,
-        vmax=config.WATERFALL_VMAX_DBFS,
+        vmin=-140.0,
+        vmax=-20.0,
     )
     ax_waterfall.set_title("Carrier-Centered Waterfall")
     ax_waterfall.set_xlabel("Offset From Carrier (kHz)")
     ax_waterfall.set_ylabel("Frame")
+    # Both frequency markers in the waterfall too
     ax_waterfall.axvline(config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.8, alpha=0.6, linestyle="--")
     ax_waterfall.axvline(-config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.8, alpha=0.6, linestyle="--")
+    ax_waterfall.axvline(config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.8, alpha=0.6, linestyle="--")
+    ax_waterfall.axvline(-config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.8, alpha=0.6, linestyle="--")
 
     carrier_status = carrier_fig.text(0.01, 0.01, "Centering...", ha="left", va="bottom")
 
@@ -248,64 +202,91 @@ def setup_carrier_window() -> CarrierWindow:
     )
 
 
-def setup_ncc_window() -> NccWindow:
-    """Create the two-panel NCC demodulator window (NCC history + AM envelope)."""
-    ncc_fig, (ax_ncc, ax_env) = plt.subplots(2, 1, figsize=(10, 5))
-    ncc_fig.canvas.manager.set_window_title("Coherent 1 kHz Demodulator")
-    ncc_fig.suptitle("Coherent AM Demodulation — 1 kHz Square-Wave NCC")
+def setup_fsk_window() -> FskWindow:
+    """FSK demodulator window â€” replaces the OOK NCC window.
 
-    ncc_history = np.zeros(config.NCC_HISTORY_FRAMES, dtype=np.float64)
-    ncc_time_axis = np.arange(config.NCC_HISTORY_FRAMES)
-    (line_ncc,) = ax_ncc.plot(ncc_time_axis, ncc_history, lw=1.2, color="C2")
-    ax_ncc.axhline(0.0, color="0.5", lw=0.8, linestyle="--")
-    ax_ncc.axhline(
-        config.NCC_ENTER_THRESHOLD,
-        color="lime",
-        lw=0.8,
-        linestyle=":",
-        label="detect threshold",
+    Top panel: rolling history of m_f1, m_f0, and decision metric per buffer.
+    Bottom panel: per-chip decisions (binary trace) plus the two metrics
+    that produced them, so you can SEE which frequency dominated each chip.
+    """
+    METRIC_HISTORY = 200
+    fsk_fig, (ax_metrics, ax_chips) = plt.subplots(2, 1, figsize=(10, 5))
+    fsk_fig.canvas.manager.set_window_title("FSK Demodulator")
+    fsk_fig.suptitle(
+        f"FSK Demodulation â€” m({config.FSK_F1_HZ/1000:.1f} kHz) vs m({config.FSK_F0_HZ/1000:.1f} kHz)"
     )
-    ax_ncc.axhline(-config.NCC_ENTER_THRESHOLD, color="lime", lw=0.8, linestyle=":")
-    ax_ncc.set_ylim(-1.0, 1.0)
-    ax_ncc.set_ylabel("NCC")
-    ax_ncc.set_xlabel("Frame")
-    ax_ncc.set_title("Normalised Cross-Correlation vs 1 kHz Square Wave")
-    ax_ncc.legend(loc="upper right", fontsize=8)
-    ax_ncc.grid(True, alpha=0.3)
 
-    env_plot_len = config.CHIP_VIEW_HISTORY
-    chip_axis = np.arange(env_plot_len)
-    (line_env,) = ax_env.plot(
-        chip_axis, np.zeros(env_plot_len), lw=1.1, color="C0", label="|NCC| per chip",
+    metric_history_f1 = np.zeros(METRIC_HISTORY, dtype=np.float64)
+    metric_history_f0 = np.zeros(METRIC_HISTORY, dtype=np.float64)
+    metric_history_decision = np.zeros(METRIC_HISTORY, dtype=np.float64)
+    metric_axis = np.arange(METRIC_HISTORY)
+
+    (line_m_f1,) = ax_metrics.plot(
+        metric_axis, metric_history_f1, lw=1.0, color="lime",
+        label=f"m({config.FSK_F1_HZ/1000:.1f} kHz)  ['1']",
     )
-    (line_env_bits,) = ax_env.step(
-        chip_axis, np.zeros(env_plot_len), where="mid", lw=0.9, color="C3", alpha=0.8,
+    (line_m_f0,) = ax_metrics.plot(
+        metric_axis, metric_history_f0, lw=1.0, color="orange",
+        label=f"m({config.FSK_F0_HZ/1000:.1f} kHz)  ['0']",
+    )
+    (line_decision,) = ax_metrics.plot(
+        metric_axis, metric_history_decision, lw=1.2, color="C0",
+        label="decision (m_f1 - m_f0)", alpha=0.85,
+    )
+    ax_metrics.axhline(0.0, color="0.5", lw=0.8, linestyle="--")
+    ax_metrics.axhline(
+        config.FSK_DECISION_DEAD_ZONE, color="0.5", lw=0.6, linestyle=":", alpha=0.6,
+    )
+    ax_metrics.axhline(
+        -config.FSK_DECISION_DEAD_ZONE, color="0.5", lw=0.6, linestyle=":", alpha=0.6,
+    )
+    ax_metrics.set_ylabel("Metric")
+    ax_metrics.set_xlabel("Frame")
+    ax_metrics.set_title("Per-Buffer FSK Metrics")
+    ax_metrics.set_ylim(-0.5, 0.8)
+    ax_metrics.legend(loc="upper right", fontsize=8)
+    ax_metrics.grid(True, alpha=0.3)
+
+    chip_history_len = config.CHIP_VIEW_HISTORY
+    chip_axis = np.arange(chip_history_len)
+    (line_chip_m_f1,) = ax_chips.plot(
+        chip_axis, np.zeros(chip_history_len), lw=0.9, color="lime", alpha=0.75,
+        label=f"m({config.FSK_F1_HZ/1000:.1f} kHz) per chip",
+    )
+    (line_chip_m_f0,) = ax_chips.plot(
+        chip_axis, np.zeros(chip_history_len), lw=0.9, color="orange", alpha=0.75,
+        label=f"m({config.FSK_F0_HZ/1000:.1f} kHz) per chip",
+    )
+    (line_chip_decision,) = ax_chips.step(
+        chip_axis, np.zeros(chip_history_len), where="mid", lw=1.1, color="C3", alpha=0.9,
         label="chip decision (scaled)",
     )
-    env_threshold_line = ax_env.axhline(
-        config.BIT_NCC_THRESHOLD, color="lime", lw=0.9, linestyle="--", label="chip threshold"
+    ax_chips.set_ylabel("Metric / Decision")
+    ax_chips.set_xlabel("Recent Chip Index")
+    ax_chips.set_title(
+        f"Per-Chip FSK Metrics ({config.BIT_DURATION_MS:.0f} ms/chip, {chip_history_len} chips history)"
     )
-    ax_env.set_ylabel("|NCC|")
-    ax_env.set_xlabel("Recent Chip Index")
-    ax_env.set_title(
-        f"Chip Decisions ({config.BIT_DURATION_MS:.0f} ms/chip, {env_plot_len} chips history)"
-    )
-    ax_env.set_ylim(0.0, 1.0)
-    ax_env.legend(loc="upper right", fontsize=8)
-    ax_env.grid(True, alpha=0.3)
+    ax_chips.set_ylim(0.0, 1.0)
+    ax_chips.legend(loc="upper right", fontsize=8)
+    ax_chips.grid(True, alpha=0.3)
 
-    ncc_status = ncc_fig.text(0.01, 0.01, "Waiting...", ha="left", va="bottom")
-    ncc_fig.tight_layout(rect=(0, 0.04, 1, 0.95))
+    status = fsk_fig.text(0.01, 0.01, "Waiting...", ha="left", va="bottom")
+    fsk_fig.tight_layout(rect=(0, 0.04, 1, 0.95))
 
-    return NccWindow(
-        fig=ncc_fig,
-        ax_ncc=ax_ncc,
-        ax_env=ax_env,
-        line_ncc=line_ncc,
-        line_env=line_env,
-        line_env_bits=line_env_bits,
-        env_threshold_line=env_threshold_line,
-        ncc_status=ncc_status,
-        ncc_history=ncc_history,
-        env_plot_len=env_plot_len,
+    return FskWindow(
+        fig=fsk_fig,
+        ax_metrics=ax_metrics,
+        ax_chips=ax_chips,
+        line_m_f1=line_m_f1,
+        line_m_f0=line_m_f0,
+        line_decision=line_decision,
+        line_chip_decision=line_chip_decision,
+        line_chip_m_f1=line_chip_m_f1,
+        line_chip_m_f0=line_chip_m_f0,
+        status=status,
+        metric_history_f1=metric_history_f1,
+        metric_history_f0=metric_history_f0,
+        metric_history_decision=metric_history_decision,
+        chip_history_len=chip_history_len,
     )
+
