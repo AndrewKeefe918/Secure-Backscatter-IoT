@@ -99,6 +99,13 @@ class ReceiverLoopRxOnly:
         self.late_frame_count = 0
         self.gap_slip_count = 0
 
+        self.secure_rx = SecureReceiver(
+            bytes.fromhex(config.SHARED_KEY_HEX),
+            Path(config.SECURE_RX_STATE_PATH),
+        )
+        self.decoded_packets = 0
+        self._packet_cache: dict[tuple, object] = {}
+
         capture_path = Path(config.RX_CAPTURE_NDJSON)
         capture_path.parent.mkdir(parents=True, exist_ok=True)
         self.capture_file = capture_path.open("a", encoding="ascii")
@@ -193,13 +200,7 @@ class ReceiverLoopRxOnly:
 
     def _update_live_decode_summary(self) -> None:
         header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
-        require_known_payload = bool(config.LIVE_DECODE_REQUIRE_KNOWN_PAYLOAD)
-        expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES) if require_known_payload else []
-        payload_len = (
-            len(expected_payload_bits)
-            if require_known_payload
-            else int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
-        )
+        payload_len = int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
         packet_bits = len(header_bits) + payload_len
 
         best_text = "No live decode yet"
@@ -252,30 +253,41 @@ class ReceiverLoopRxOnly:
                     if weak_bits > int(config.LIVE_DECODE_MAX_WEAK_BITS):
                         continue
 
-                    if require_known_payload:
-                        payload_errors_normal = sum(
-                            1 for left, right in zip(payload_bits, expected_payload_bits) if left != right
-                        )
-                        if config.ALLOW_INVERTED_PAYLOAD_MATCH:
-                            payload_errors_inverted = sum(
-                                1 for left, right in zip(payload_bits, expected_payload_bits) if (1 - left) != right
+                    # Compute absolute bit position for deduplication across frames.
+                    header_abs = state.base_chip_index + header_idx
+
+                    # Verify once per unique absolute packet position; cache the result
+                    # so repeated scans of the same chip window don't consume the
+                    # replay counter or produce duplicate AUTHENTICATED log lines.
+                    cache_key = (phase, decode_offset, header_abs)
+                    if cache_key not in self._packet_cache:
+                        result = self.secure_rx.verify_and_decrypt(payload)
+                        self._packet_cache[cache_key] = result
+                        if result.valid:
+                            self.decoded_packets += 1
+                            print(
+                                f"[RX PACKET {self.decoded_packets}] phase={phase} "
+                                f"chip_offset={decode_offset} bit={header_abs} "
+                                f"header_errors={header_errors} "
+                                f"counter={result.counter} plaintext={result.plaintext!r}  AUTHENTICATED",
+                                flush=True,
                             )
-                        else:
-                            payload_errors_inverted = payload_errors_normal
-                        payload_errors = min(payload_errors_normal, payload_errors_inverted)
-                        if payload_errors > config.LIVE_DECODE_MAX_PAYLOAD_ERRORS:
-                            continue
-                        polarity = "inverted" if payload_errors_inverted < payload_errors_normal else "normal"
-                        score = (payload_errors, header_errors, weak_bits, recency)
+                    else:
+                        result = self._packet_cache[cache_key]
+
+                    if result.valid:
+                        score = (0, header_errors, weak_bits, recency)
                         text = (
                             f"phase={phase} off={decode_offset} bit={header_idx} herr={header_errors} "
-                            f"perr={payload_errors} weak={weak_bits} payload={payload.hex().upper()} {payload!r} {polarity}"
+                            f"weak={weak_bits} counter={result.counter} "
+                            f"plaintext={result.plaintext!r}  AUTHENTICATED"
                         )
                     else:
-                        score = (header_errors, weak_bits, recency)
+                        score = (1, header_errors, weak_bits, recency)
                         text = (
                             f"phase={phase} off={decode_offset} bit={header_idx} herr={header_errors} "
-                            f"weak={weak_bits} payload={payload.hex().upper()} {payload!r} unknown"
+                            f"weak={weak_bits} payload={payload.hex().upper()} "
+                            f"REJECTED: {result.reason}"
                         )
 
                     if best_score is None or score < best_score:

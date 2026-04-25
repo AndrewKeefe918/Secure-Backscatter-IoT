@@ -40,9 +40,9 @@ RENDER_PLOTS = False
 
 # ---- Lightweight receiver architecture --------------------------------------
 RX_ONLY_MODE = True
-RX_CAPTURE_NDJSON = "Receiver_FSK_secure/captures/chips_capture.ndjson"
+RX_CAPTURE_NDJSON = "Secure_Code/captures/chips_capture.ndjson"
 RX_ONLY_PEAK_TRACK_EVERY_FRAMES = 8
-RX_STATUS_JSON = "Receiver_FSK_secure/captures/rx_status.json"
+RX_STATUS_JSON = "Secure_Code/captures/rx_status.json"
 RX_STATUS_EVERY_FRAMES = 5
 RX_MONITOR_SPECTRUM_BINS = 192
 RX_TERMINAL_STATUS_EVERY_FRAMES = 30
@@ -125,7 +125,7 @@ SHARED_KEY_HEX = "2b7e151628aed2a6abf7158809cf4f3c"
 # JSON file in which the SecureReceiver persists "highest accepted counter".
 # Delete this file to reset the replay window (e.g., when re-flashing the
 # tag with a fresh counter that is below the last accepted value).
-SECURE_RX_STATE_PATH = "Receiver_FSK_secure/captures/secure_rx_state.json"
+SECURE_RX_STATE_PATH = "Secure_Code/captures/secure_rx_state.json"
 
 # ---- NCC lock detection -----------------------------------------------------
 NCC_DISPLAY_ALPHA = 0.2

@@ -22,6 +22,7 @@ from .packet_decoder_secure import (
     bits_to_text,
     majority_decode_triplets,
 )
+from .secure_packet import SecureReceiver
 
 
 class MonitorState:
@@ -45,6 +46,8 @@ class MonitorState:
         self.logic_tail_label = "phase=0 off=0"
         self.packet_bits: list[int] = []
         self.packet_bits_label = "phase=0 off=0"
+        self.secure_rx = SecureReceiver(bytes.fromhex(config.SHARED_KEY_HEX), state_path=None)
+        self.verified_packets: dict[tuple, object] = {}
 
 
 def _read_status(path: Path) -> dict[str, object] | None:
@@ -100,13 +103,7 @@ def _weak_triplet_count(
 
 def _update_live_decode(state: MonitorState) -> None:
     header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
-    require_known_payload = bool(config.LIVE_DECODE_REQUIRE_KNOWN_PAYLOAD)
-    expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES) if require_known_payload else []
-    payload_len = (
-        len(expected_payload_bits)
-        if require_known_payload
-        else int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
-    )
+    payload_len = int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
     packet_bits = len(header_bits) + payload_len
 
     best_text = "No live decode yet"
@@ -157,30 +154,37 @@ def _update_live_decode(state: MonitorState) -> None:
                 if weak_bits > int(config.LIVE_DECODE_MAX_WEAK_BITS):
                     continue
 
-                if require_known_payload:
-                    payload_errors_normal = sum(
-                        1 for left, right in zip(payload_bits, expected_payload_bits) if left != right
-                    )
-                    if config.ALLOW_INVERTED_PAYLOAD_MATCH:
-                        payload_errors_inverted = sum(
-                            1 for left, right in zip(payload_bits, expected_payload_bits) if (1 - left) != right
+                # Verify once per (phase, offset, header_idx) position to avoid
+                # re-consuming the replay counter on repeated monitor scans.
+                cache_key = (phase, decode_offset, header_idx)
+                if cache_key not in state.verified_packets:
+                    result = state.secure_rx.verify_and_decrypt(payload)
+                    state.verified_packets[cache_key] = result
+                    if result.valid:
+                        state.packet_events.appendleft(
+                            f"AUTHENTICATED cnt={result.counter} "
+                            f"phase={phase} off={decode_offset} bit={header_idx}"
                         )
-                    else:
-                        payload_errors_inverted = payload_errors_normal
-                    payload_errors = min(payload_errors_normal, payload_errors_inverted)
-                    if payload_errors > config.LIVE_DECODE_MAX_PAYLOAD_ERRORS:
-                        continue
-                    polarity = "inverted" if payload_errors_inverted < payload_errors_normal else "normal"
-                    score = (payload_errors, header_errors, weak_bits, recency)
+                    elif "replay" not in result.reason:
+                        state.packet_events.appendleft(
+                            f"REJECTED [{result.reason[:30]}] phase={phase}"
+                        )
+                else:
+                    result = state.verified_packets[cache_key]
+
+                if result.valid:
+                    score = (0, header_errors, weak_bits, recency)
                     text = (
                         f"phase={phase} off={decode_offset} bit={header_idx} "
-                        f"herr={header_errors} perr={payload_errors} weak={weak_bits} payload={payload.hex().upper()} {payload!r} {polarity}"
+                        f"herr={header_errors} weak={weak_bits} "
+                        f"counter={result.counter} plaintext={result.plaintext!r}  AUTHENTICATED"
                     )
                 else:
-                    score = (header_errors, weak_bits, recency)
+                    score = (1, header_errors, weak_bits, recency)
                     text = (
                         f"phase={phase} off={decode_offset} bit={header_idx} "
-                        f"herr={header_errors} weak={weak_bits} payload={payload.hex().upper()} {payload!r} unknown"
+                        f"herr={header_errors} weak={weak_bits} "
+                        f"payload={payload.hex().upper()} REJECTED: {result.reason}"
                     )
 
                 if best_score is None or score < best_score:
@@ -190,12 +194,6 @@ def _update_live_decode(state: MonitorState) -> None:
                     best_tail_label = f"phase={phase} off={decode_offset}"
                     best_packet_bits = decoded_bits[header_idx:payload_end]
                     best_packet_label = f"phase={phase} off={decode_offset} bit={header_idx}"
-
-                key = (phase, decode_offset)
-                matched = (payload_errors == 0 and header_errors == 0) if require_known_payload else (header_errors == 0)
-                if matched and header_idx > state.last_announced_bit.get(key, -1):
-                    state.last_announced_bit[key] = header_idx
-                    state.packet_events.appendleft(f"PKT phase={phase} off={decode_offset} bit={header_idx}")
 
     state.last_packet_text = best_text
     state.logic_tail_bits = best_tail_bits

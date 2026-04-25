@@ -40,6 +40,8 @@ from .packet_decoder import (
     safe_ascii,
 )
 from .gui_setup import BasebandWindow, CarrierWindow, FskWindow
+from .secure_packet import SecureReceiver
+from pathlib import Path
 
 
 @dataclass
@@ -81,8 +83,13 @@ class ReceiverLoop:
         self.phase_sample_buffer = np.array([], dtype=np.complex64)
         self.phase_state = {p: PhaseState(next_sample=p) for p in self.phase_offsets}
         self.packet_header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
-        self.expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES)
-        self.payload_bits_len = len(config.PAYLOAD_BYTES) * 8
+        # Secure mode: fixed 16-byte payload (COUNTER||CIPHERTEXT||TAG); no length byte.
+        self.payload_bits_len = int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
+        self.secure_rx = SecureReceiver(
+            bytes.fromhex(config.SHARED_KEY_HEX),
+            Path(config.SECURE_RX_STATE_PATH),
+        )
+        self._packet_cache: dict[tuple, object] = {}
         self.packet_status_text = "Waiting for preamble+sync"
         self.packet_status_hold = 0
         self.decoded_packets = 0
@@ -220,51 +227,46 @@ class ReceiverLoop:
                     payload_bits = decoded_bits[payload_start:payload_end]
                     payload = bits_to_bytes(payload_bits)
                     payload_hex = payload.hex().upper() if payload else ""
-                    payload_errors_normal = sum(
-                        1
-                        for left, right in zip(payload_bits, self.expected_payload_bits)
-                        if left != right
-                    )
-                    if config.ALLOW_INVERTED_PAYLOAD_MATCH:
-                        payload_errors_inverted = sum(
-                            1
-                            for left, right in zip(payload_bits, self.expected_payload_bits)
-                            if (1 - left) != right
-                        )
+
+                    # Verify once per unique absolute packet position to avoid
+                    # re-consuming the replay counter on repeated frame scans.
+                    cache_key = (phase, decode_offset, header_abs)
+                    if cache_key not in self._packet_cache:
+                        result = self.secure_rx.verify_and_decrypt(payload)
+                        self._packet_cache[cache_key] = result
                     else:
-                        payload_errors_inverted = payload_errors_normal
-                    use_inverted = payload_errors_inverted < payload_errors_normal
-                    payload_errors = min(payload_errors_normal, payload_errors_inverted)
-                    polarity = "inverted" if use_inverted else "normal"
+                        result = self._packet_cache[cache_key]
+
                     if self.header_logs_this_frame < int(config.HEADER_LOGS_PER_FRAME):
                         print(
                             f"[RX HEADER] phase={phase} chip_offset={decode_offset} "
                             f"bit={header_abs} {tag} header_errors={header_errors} "
-                            f"payload_errors={payload_errors} payload_polarity={polarity} "
-                            f"payload_hex={payload_hex} payload_ascii={safe_ascii(payload)!r}",
+                            f"counter={result.counter} valid={result.valid} "
+                            f"reason={result.reason!r} payload_hex={payload_hex}",
                             flush=True,
                         )
                         self.header_logs_this_frame += 1
                     else:
                         self.header_logs_suppressed_this_frame += 1
 
-                    if payload_errors <= config.PAYLOAD_MAX_BIT_ERRORS:
+                    if result.valid:
                         self.decoded_packets += 1
                         self.packet_status_text = (
-                            f"Packet: OPEN detected at phase {phase}, offset {decode_offset}, "
-                            f"{tag}, payload_errors={payload_errors}, payload_polarity={polarity}"
+                            f"AUTHENTICATED {result.plaintext.decode('ascii', errors='replace')}  counter={result.counter}  "
+                            f"phase={phase}  offset={decode_offset}  {tag}  "
+                            f"header_errors={header_errors}"
                         )
                         print(
-                            f"[RX PACKET {self.decoded_packets}] phase={phase} chip_offset={decode_offset} "
-                            f"bit={header_abs} {tag} header_errors={header_errors} "
-                            f"payload_errors={payload_errors} payload_polarity={polarity} PREAMBLE+SYNC+OPEN",
+                            f"[RX PACKET {self.decoded_packets}] phase={phase} "
+                            f"chip_offset={decode_offset} bit={header_abs} {tag} "
+                            f"header_errors={header_errors} counter={result.counter} "
+                            f"plaintext={result.plaintext!r}  AUTHENTICATED",
                             flush=True,
                         )
                     else:
                         self.packet_status_text = (
-                            f"Packet: header phase {phase}, offset {decode_offset}, "
-                            f"{tag}, errors={header_errors}, payload_errors={payload_errors}, "
-                            f"payload_polarity={polarity}, payload={payload!r}"
+                            f"REJECT [{result.reason}]  counter={result.counter}  "
+                            f"phase={phase}  offset={decode_offset}  {tag}"
                         )
 
                     self.packet_status_hold = config.PACKET_STATUS_HOLD_FRAMES

@@ -43,7 +43,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
 
-    print("Starting Pluto FSK receiver (RX-only mode)...")
+    print("Starting Pluto FSK receiver (RX-only mode, SECURE: AES-128 + CMAC + counter)...")
     print(f"  RX URI         : {config.RX_URI}")
     print(f"  Freq (Hz)      : {int(config.FREQ_HZ)}")
     print(f"  SR (SPS)       : {int(config.SAMPLE_RATE)}")
@@ -54,8 +54,9 @@ def main() -> int:
     print(f"  '0' subcarrier : {config.FSK_F0_HZ:.1f} Hz")
     print(f"  Bit duration   : {config.BIT_DURATION_MS:.0f} ms")
     print(f"  Repetition     : {config.REPETITION_CHIPS} chip(s) per bit")
-    print(f"  Packet detect   : header {config.PREAMBLE_BYTES.hex().upper()} {config.SYNC_BYTES.hex().upper()} "
-          f"+ length byte + up to {int(config.LIVE_DECODE_MAX_PAYLOAD_BYTES)} payload byte(s)")
+    print(f"  Secure mode    : {config.SECURE_MODE}  (key={config.SHARED_KEY_HEX[:8]}...)")
+    print(f"  Payload format : COUNTER(4) || AES-CTR ciphertext(4) || CMAC tag(8)  [{config.LIVE_DECODE_PAYLOAD_BYTES} bytes]")
+    print(f"  Replay state   : {config.SECURE_RX_STATE_PATH}")
     print(f"  Capture output : {config.RX_CAPTURE_NDJSON}")
     print(f"  Status output  : {config.RX_STATUS_JSON}")
     print("  Monitor        : python -m receiver.rx_monitor  (separate terminal)")

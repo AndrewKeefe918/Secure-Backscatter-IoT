@@ -2,9 +2,7 @@
 """Orchestrator — initialises the SDR, builds the GUI windows, and runs the animation.
 
 Run as a module from the repo root:
-    python -m Receiver_FSK_secure.main_secure
-
-(or rename the files to drop the `_fsk` suffix and run the OOK entrypoint.)
+    python -m Secure_Code.main_secure
 """
 
 import signal

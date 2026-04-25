@@ -55,7 +55,10 @@ static const uint8_t SHARED_KEY[16] = {
 };
 
 /* ---- Plaintext command -------------------------------------------------- */
-/* Could become variable in the future; CMAC and CTR scale to any length. */
+/* P1.3 is an active-low reed input with the internal pull-up enabled:
+ *   - switch open / disconnected -> logic 1 -> transmit "OPEN"
+ *   - switch shut / grounded     -> logic 0 -> stay silent */
+#define REED_SWITCH_BIT  BIT3
 #define PT_LEN  4U
 static const uint8_t PT_OPEN[PT_LEN] = { 'O', 'P', 'E', 'N' };
 
@@ -167,6 +170,24 @@ static void transmit_byte(uint8_t b) {
 
 /* ---- Packet construction ------------------------------------------------ */
 
+static uint8_t reed_switch_is_open(void) {
+    return (P1IN & REED_SWITCH_BIT) != 0U;
+}
+
+static void subcarrier_enable(void) {
+    TA0CCR0  = CCR0_FOR_1_BIT;
+    TA0CCTL0 &= ~CCIFG;
+    TA0CTL   = TASSEL_2 | MC_1 | TACLR;
+    P1SEL   |= BIT1;
+}
+
+static void subcarrier_disable(void) {
+    P1SEL   &= ~BIT1;
+    P1OUT   &= ~BIT1;
+    TA0CTL   = TASSEL_2 | MC_0 | TACLR;
+    TA0CCTL0 &= ~CCIFG;
+}
+
 static void build_packet(void) {
     uint32_t ctr;
     uint8_t  iv[16];
@@ -192,7 +213,7 @@ static void build_packet(void) {
     iv[3] = packet_buf[5];
     memset(&iv[4], 0, 12);
 
-    /* Encrypt PT_OPEN with AES-CTR -> ciphertext at packet_buf[6..9]. */
+    /* Encrypt the fixed OPEN command with AES-CTR -> packet_buf[6..9]. */
     aes128_ctr_xcrypt(&aes_ctx, iv, PT_OPEN, &packet_buf[6], PT_LEN);
 
     /* CMAC over (counter || ciphertext) = packet_buf[2..9], 8 bytes total. */
@@ -246,23 +267,32 @@ int main(void) {
 
     /* GPIO setup */
     P1DIR  |=  (BIT0 | BIT1 | BIT6);
+    P1DIR  &= ~REED_SWITCH_BIT;
     P1OUT  &= ~(BIT0 | BIT1 | BIT6);
-    P1SEL2 &= ~BIT1;
+    P1OUT  |= REED_SWITCH_BIT;
+    P1REN  |= REED_SWITCH_BIT;
+    P1SEL  &= ~REED_SWITCH_BIT;
+    P1SEL2 &= ~(BIT1 | REED_SWITCH_BIT);
 
-    /* Timer_A0 setup (same as original): SMCLK / up / toggle on CCR0. */
+    /* Timer_A0 setup: leave the timer disconnected until the reed opens. */
     TA0CCR0  = CCR0_FOR_1_BIT;
     TA0CCTL0 = OUTMOD_4;
-    TA0CTL   = TASSEL_2 | MC_1 | TACLR;
-    TA0CCTL0 &= ~CCIFG;
-    P1SEL |= BIT1;                           /* route timer output to P1.1 */
+    subcarrier_disable();
 
     /* Crypto + counter init must come AFTER clock setup (flash needs SMCLK). */
     aes128_init(&aes_ctx, SHARED_KEY);
     counter_init();
 
     while (1) {
-        build_packet();
-        transmit_packet();
-        delay_ms(GAP_BETWEEN_PACKETS_MS);
+        if (reed_switch_is_open()) {
+            subcarrier_enable();
+            build_packet();
+            transmit_packet();
+            delay_ms(GAP_BETWEEN_PACKETS_MS);
+        } else {
+            subcarrier_disable();
+            P1OUT &= ~(BIT0 | BIT6);
+            delay_ms(100U);
+        }
     }
 }

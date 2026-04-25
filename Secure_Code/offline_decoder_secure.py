@@ -21,6 +21,7 @@ from .packet_decoder_secure import (
     majority_decode_triplets,
     safe_ascii,
 )
+from .secure_packet import SecureReceiver
 
 
 def _load_capture(path: Path) -> dict[int, list[int]]:
@@ -48,8 +49,9 @@ def _load_capture(path: Path) -> dict[int, list[int]]:
 
 def _decode_candidates(chips_by_phase: dict[int, list[int]], top: int) -> list[dict[str, object]]:
     header_bits = bytes_to_bit_list(config.PREAMBLE_BYTES + config.SYNC_BYTES)
-    expected_payload_bits = bytes_to_bit_list(config.PAYLOAD_BYTES)
-    payload_len = len(expected_payload_bits)
+    payload_len = int(config.LIVE_DECODE_PAYLOAD_BYTES) * 8
+    key = bytes.fromhex(config.SHARED_KEY_HEX)
+    rx = SecureReceiver(key, state_path=None)
 
     rows: list[dict[str, object]] = []
 
@@ -80,22 +82,7 @@ def _decode_candidates(chips_by_phase: dict[int, list[int]], top: int) -> list[d
 
                 payload_bits = decoded_bits[payload_start:payload_end]
                 payload = bits_to_bytes(payload_bits)
-                payload_errors_normal = sum(
-                    1
-                    for left, right in zip(payload_bits, expected_payload_bits)
-                    if left != right
-                )
-                if config.ALLOW_INVERTED_PAYLOAD_MATCH:
-                    payload_errors_inverted = sum(
-                        1
-                        for left, right in zip(payload_bits, expected_payload_bits)
-                        if (1 - left) != right
-                    )
-                else:
-                    payload_errors_inverted = payload_errors_normal
-
-                payload_errors = min(payload_errors_normal, payload_errors_inverted)
-                polarity = "inverted" if payload_errors_inverted < payload_errors_normal else "normal"
+                result = rx.verify_and_decrypt(payload)
 
                 rows.append(
                     {
@@ -103,15 +90,16 @@ def _decode_candidates(chips_by_phase: dict[int, list[int]], top: int) -> list[d
                         "chip_offset": decode_offset,
                         "bit": header_idx,
                         "header_errors": header_errors,
-                        "payload_errors": payload_errors,
-                        "payload_polarity": polarity,
+                        "valid": result.valid,
+                        "counter": result.counter,
+                        "plaintext": result.plaintext.decode("ascii", errors="replace") if result.valid else "",
+                        "reason": result.reason,
                         "payload_hex": payload.hex().upper(),
-                        "payload_ascii": safe_ascii(payload),
                     }
                 )
                 search_start = header_idx + 1
 
-    rows.sort(key=lambda r: (int(r["payload_errors"]), int(r["header_errors"])))
+    rows.sort(key=lambda r: (0 if r["valid"] else 1, int(r["header_errors"])))
     return rows[:top]
 
 
@@ -141,9 +129,9 @@ def main() -> int:
     for idx, row in enumerate(candidates, start=1):
         print(
             f"[{idx:02d}] phase={row['phase']} chip_offset={row['chip_offset']} bit={row['bit']} "
-            f"header_errors={row['header_errors']} payload_errors={row['payload_errors']} "
-            f"payload_polarity={row['payload_polarity']} payload_hex={row['payload_hex']} "
-            f"payload_ascii={row['payload_ascii']!r}"
+            f"header_errors={row['header_errors']} valid={row['valid']} "
+            f"counter={row['counter']} plaintext={row['plaintext']!r} "
+            f"reason={row['reason']} payload_hex={row['payload_hex']}"
         )
 
     return 0

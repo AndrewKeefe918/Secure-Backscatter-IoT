@@ -30,6 +30,8 @@ from .dsp import (
 )
 from .live_decode import analyze_live_decode
 from .packet_decoder import bits_to_text
+from .secure_packet import DecodedPacket
+from .secure_packet import SecureReceiver
 
 
 @dataclass
@@ -99,6 +101,14 @@ class ReceiverLoopRxOnly:
         self.capture_file = capture_path.open("a", encoding="ascii")
         self.status_path = Path(config.RX_STATUS_JSON)
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
+        self.secure_rx = SecureReceiver(
+            bytes.fromhex(config.SHARED_KEY_HEX),
+            Path(config.SECURE_RX_STATE_PATH),
+        )
+        self._packet_cache: dict[bytes, DecodedPacket] = {}
+        self.decoded_packets = 0
+        self.decode_status_hold = 0
+        self.last_reject_signature = ""
 
     def close(self) -> None:
         try:
@@ -168,9 +178,74 @@ class ReceiverLoopRxOnly:
 
     def _update_live_decode_summary(self) -> None:
         chips_by_phase = {phase: state.chips for phase, state in self.phase_state.items()}
-        analysis = analyze_live_decode(chips_by_phase, tail_bits=48, include_matches=False)
-        self.last_decode_summary = analysis.best_text
+        base_chip_index_by_phase = {
+            phase: state.base_chip_index for phase, state in self.phase_state.items()
+        }
+        analysis = analyze_live_decode(
+            chips_by_phase,
+            tail_bits=48,
+            include_matches=False,
+            secure_rx=self.secure_rx,
+            verified_cache=self._packet_cache,
+            base_chip_index_by_phase=base_chip_index_by_phase,
+        )
+
+        is_auth = "AUTHENTICATED" in analysis.best_text
+        is_reject = "REJECTED" in analysis.best_text
+        is_cached = "[cached]" in analysis.best_text
+        last_is_auth = "AUTHENTICATED" in self.last_decode_summary
+
+        reject_signature = ""
+        if is_reject and "payload=" in analysis.best_text:
+            payload_token = analysis.best_text.split("payload=", 1)[1].split(" ", 1)[0]
+            reason_token = analysis.best_text.split(": ", 1)[1] if ": " in analysis.best_text else ""
+            reject_signature = f"{payload_token}|{reason_token}"
+        same_cached_reject = bool(
+            is_reject
+            and is_cached
+            and reject_signature
+            and reject_signature == self.last_reject_signature
+        )
+
+        # Keep authenticated summaries stable for a short hold window.
+        # Reject reasons are still shown, but they don't immediately displace a
+        # fresh authenticated packet in the very next status frame.
+        auth_hold_frames = max(
+            int(config.PACKET_STATUS_HOLD_FRAMES),
+            int(config.RX_TERMINAL_STATUS_EVERY_FRAMES) + 1,
+        )
+        reject_hold_frames = int(config.RX_TERMINAL_STATUS_EVERY_FRAMES) + 1
+
+        if is_auth:
+            self.last_decode_summary = analysis.best_text
+            self.decode_status_hold = auth_hold_frames
+            self.last_reject_signature = ""
+        elif is_reject and self.decode_status_hold > 0 and last_is_auth:
+            self.decode_status_hold -= 1
+        elif same_cached_reject:
+            # Suppress noisy repeats of the exact same cached reject candidate.
+            self.last_decode_summary = "No live decode yet"
+            self.decode_status_hold = 0
+        elif analysis.best_text != "No live decode yet":
+            self.last_decode_summary = analysis.best_text
+            self.decode_status_hold = reject_hold_frames if is_reject else auth_hold_frames
+            if is_reject:
+                self.last_reject_signature = reject_signature
+            else:
+                self.last_reject_signature = ""
+        elif self.decode_status_hold > 0:
+            self.decode_status_hold -= 1
+        else:
+            self.last_decode_summary = analysis.best_text
+
         self.last_logic_tail = bits_to_text(analysis.best_tail_bits) if analysis.best_tail_bits else ""
+
+        # Keep cache bounded for long-running captures.
+        max_cache = 2048
+        if len(self._packet_cache) > max_cache:
+            drop = len(self._packet_cache) - max_cache
+            for _ in range(drop):
+                self._packet_cache.pop(next(iter(self._packet_cache)))
 
     def _emit_status(self, peak_hz: float) -> None:
         if self.frame_index % max(1, int(config.RX_TERMINAL_STATUS_EVERY_FRAMES)) != 0:

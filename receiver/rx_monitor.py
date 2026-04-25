@@ -18,7 +18,7 @@ from matplotlib.animation import FuncAnimation
 from . import config as config
 from .live_decode import analyze_live_decode
 from .packet_decoder import (
-    bits_to_text,
+    bits_to_bytes,
     bytes_to_bit_list,
 )
 
@@ -87,7 +87,8 @@ def _update_live_decode(state: MonitorState) -> None:
         key = (phase, decode_offset)
         if header_idx > state.last_announced_bit.get(key, -1):
             state.last_announced_bit[key] = header_idx
-            state.packet_events.appendleft(f"PKT phase={phase} off={decode_offset} bit={header_idx}")
+            label = "AUTHENTICATED" if config.SECURE_MODE else "PKT"
+            state.packet_events.appendleft(f"{label} phase={phase} off={decode_offset} bit={header_idx}")
 
 
 def main() -> int:
@@ -259,9 +260,9 @@ def main() -> int:
             bit_axis = np.arange(bit_vals.size, dtype=np.float64)
             line_bits.set_data(bit_axis, bit_vals)
             ax_bits.set_xlim(0, max(1, bit_vals.size - 1))
+            packet_hex = bits_to_bytes(packet_bits).hex().upper()
             bits_text.set_text(
-                f"{state.packet_bits_label}\n"
-                f"bits={bits_to_text(packet_bits)}\n"
+                f"hex={packet_hex}\n"
                 f"packet={config.PREAMBLE_BYTES.hex().upper()} {config.SYNC_BYTES.hex().upper()} [len] payload"
             )
         else:

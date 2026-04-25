@@ -250,7 +250,7 @@ class ReceiverLoop:
                     if result.valid:
                         self.decoded_packets += 1
                         self.packet_status_text = (
-                            f"AUTHENTICATED OPEN  counter={result.counter}  "
+                            f"AUTHENTICATED {result.plaintext.decode('ascii', errors='replace')}  counter={result.counter}  "
                             f"phase={phase}  offset={decode_offset}  {tag}  "
                             f"header_errors={header_errors}"
                         )

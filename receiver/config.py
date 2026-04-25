@@ -38,12 +38,15 @@ RX_MONITOR_SPECTRUM_BINS = 192
 # How often the RX-only loop prints a concise radio/decode status line.
 RX_TERMINAL_STATUS_EVERY_FRAMES = 30
 # Only search this many most-recent logical bits for live packet reporting.
-LIVE_DECODE_RECENT_BITS = 96
+LIVE_DECODE_RECENT_BITS = 160
+# Also evaluate bit-inverted stream to tolerate FSK polarity flips.
+LIVE_DECODE_TRY_INVERTED = True
 # Suppress live status/monitor candidates unless they beat these quality gates.
-LIVE_DECODE_MAX_HEADER_ERRORS = 2
-# Maximum 2-of-3 majority decisions allowed across header+payload window.
+# Allow a single header bit error to recover valid packets under light corruption.
+LIVE_DECODE_MAX_HEADER_ERRORS = 1
+# Maximum weak decisions allowed across header+payload window.
 # Lower is stricter (better BER, fewer/late detections).
-LIVE_DECODE_MAX_WEAK_BITS = 6
+LIVE_DECODE_MAX_WEAK_BITS = 2
 # Number of payload bytes to extract/display after preamble+sync.
 # The first payload byte is now a length field; the receiver reads that many
 # additional bytes as the actual message.  This constant caps the search window.
@@ -92,9 +95,9 @@ FSK_DECISION_DEAD_ZONE = 0.005
 FSK_PRESENCE_FLOOR = 0.01
 
 # ---- Repetition coding ------------------------------------------------------
-# Each bit is transmitted 3 times by the firmware (111 for '1', 000 for '0').
-# The receiver majority-votes every 3 chips to recover one bit.
-REPETITION_CHIPS = 3
+# Single-bit mode: each transmitted chip is one logical bit.
+# Set >1 only if firmware repeats each bit and you want majority voting.
+REPETITION_CHIPS = 1
 LOGICAL_BIT_DURATION_MS = BIT_DURATION_MS * REPETITION_CHIPS
 SAMPLES_PER_LOGICAL_BIT = SAMPLES_PER_CHIP * REPETITION_CHIPS
 MAJORITY_ONES_THRESHOLD = (REPETITION_CHIPS // 2) + 1
@@ -107,10 +110,27 @@ ENV_Y_SMOOTH_ALPHA = 0.15
 ENV_Y_MIN_SPAN = 0.01
 
 # ---- Packet structure -------------------------------------------------------
-# Msp_FSK.c: preamble 0xAA, sync 0x7E, then N payload bytes.
+# Msp_FSK_secure.c: preamble 0xAA, sync 0x7E, then 16 payload bytes:
+#   COUNTER(4 BE) || AES-CTR ciphertext(4) || AES-CMAC tag(8)
 # Bits sent MSB-first, 50 ms/bit, 2-second gap between packets.
 PREAMBLE_BYTES = b"\xAA"
 SYNC_BYTES = b"\x7E"
+PAYLOAD_BYTES = b"OPEN"              # expected plaintext after decryption
+ALLOW_INVERTED_PAYLOAD_MATCH = False  # not applicable in secure mode (MAC is the check)
+PACKET_DECODE_ENABLED = True
+RENDER_PLOTS = False
+
+# ---- Security (AES-128-CTR + AES-CMAC + monotonic replay counter) -----------
+# SHARED_KEY_HEX must match SHARED_KEY[] in Msp_FSK_secure.c byte-for-byte.
+# The default is the RFC 4493 demo key — change before any deployment and
+# re-flash the tag firmware with the matching bytes.
+SECURE_MODE = True
+SHARED_KEY_HEX = "2b7e151628aed2a6abf7158809cf4f3c"
+# JSON file that persists the highest accepted counter across receiver runs.
+# Delete this file to reset replay state when re-flashing the tag.
+SECURE_RX_STATE_PATH = "receiver/captures/secure_rx_state.json"
+# Fixed payload size in secure mode: COUNTER(4) + CIPHERTEXT(4) + TAG(8).
+LIVE_DECODE_PAYLOAD_BYTES = 16
 
 # ---- NCC lock detection (used for status only in FSK mode) ------------------
 NCC_DISPLAY_ALPHA = 0.2
@@ -118,14 +138,15 @@ NCC_ENTER_THRESHOLD = 0.13
 NCC_EXIT_THRESHOLD = 0.07
 NCC_ENTER_FRAMES = 2
 NCC_EXIT_FRAMES = 8
-PACKET_STATUS_HOLD_FRAMES = 20
+# Keep authenticated status visible between packet bursts.
+PACKET_STATUS_HOLD_FRAMES = 180
 
 # ---- Debugging --------------------------------------------------------------
 TERMINAL_DEBUG_BITS_EVERY = 240
 TERMINAL_DEBUG_BIT_TAIL = 64
 # 4 ms phase step reduces per-frame phase count to ease realtime pressure.
 BIT_PHASE_STEP_SAMPLES = 4000
-PHASE_HISTORY_BITS = 128
+PHASE_HISTORY_BITS = 256
 
 # ---- Runtime jitter telemetry -----------------------------------------------
 # Report host-side timing so we can distinguish decode issues from scheduling jitter.
