@@ -5,6 +5,10 @@ This receiver uses binary FSK backscatter modulation:
 - bit `1` at 1.0 kHz subcarrier
 - bit `0` at 1.7 kHz subcarrier
 
+This is the canonical active receiver path for the project, including the
+current secure packet verification flow. Older secure-specific code has been
+moved under `archive/` and is not required to run this receiver.
+
 Run from repo root:
 
 ```bash
@@ -15,7 +19,12 @@ Optional utilities:
 
 ```bash
 python -m receiver.rx_monitor
+python -m receiver.demo_attacks
 ```
+
+`receiver.demo_attacks` exercises the live security implementation in
+`receiver/secure_packet.py` and demonstrates legitimate traffic, replay,
+tampering, and forgery outcomes without needing SDR hardware.
 
 ## What differs from OOK
 

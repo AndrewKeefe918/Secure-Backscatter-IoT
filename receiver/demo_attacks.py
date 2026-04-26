@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Demonstrate that the secure FSK link rejects forgery, replay, and tampering.
+"""Demonstrate attacks against the live receiver security implementation.
 
 No SDR or tag needed - this builds packets in software using the same
-construction as Msp_FSK_secure.c, then runs them through SecureReceiver
-to show what gets accepted and what gets rejected.
+construction as BackscatterTag/Msp_FSK_secure.c, then runs them through the
+working receiver path under receiver/ to show what gets accepted and what gets
+rejected.
 
-Run from above the package:
-    python -m Receiver_FSK_secure.demo_attacks
+Run from the repo root:
+    python -m receiver.demo_attacks
 
-Or from inside the directory:
-    python demo_attacks.py
+Or directly:
+    python receiver/demo_attacks.py
 """
 
 from __future__ import annotations
@@ -23,13 +24,15 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.cmac import CMAC
 
-# Allow running both as a package module and as a direct script.
-try:
-    from .. import config_secure as config
-    from .secure_packet import SecureReceiver, AIR_LEN, TAG_LEN
-except ImportError:
-    import config_secure as config
-    from secure_packet import SecureReceiver, AIR_LEN, TAG_LEN
+if __package__ in (None, ""):
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from receiver import config
+    from receiver.secure_packet import AIR_LEN, TAG_LEN, DecodedPacket, SecureReceiver
+else:
+    from . import config
+    from .secure_packet import AIR_LEN, TAG_LEN, DecodedPacket, SecureReceiver
 
 
 def build_packet(key: bytes, counter: int, plaintext: bytes = b"OPEN") -> bytes:
@@ -51,7 +54,7 @@ def banner(n: int, label: str) -> None:
     print(f"\n---- Scenario {n}: {label} {bar}")
 
 
-def show(description: str, payload: bytes, result) -> None:
+def show(description: str, payload: bytes, result: DecodedPacket) -> None:
     verdict = "ACCEPTED" if result.valid else "REJECTED"
     print(f"  {description}")
     print(f"    bytes:  {payload.hex()}")
@@ -61,7 +64,8 @@ def show(description: str, payload: bytes, result) -> None:
 def main() -> int:
     key = bytes.fromhex(config.SHARED_KEY_HEX)
     print(f"Using key: {config.SHARED_KEY_HEX}")
-    print("  (this must match SHARED_KEY[] in Msp_FSK_secure.c)")
+    print("  (this must match SHARED_KEY[] in BackscatterTag/Msp_FSK_secure.c)")
+    print("  (demo is using the live receiver implementation under receiver/)")
 
     # Use a throwaway state file so the demo is repeatable.
     fd, state_path = tempfile.mkstemp(suffix=".json")
@@ -96,8 +100,9 @@ def main() -> int:
     forged = build_packet(b"\x00" * 16, counter=300)
     show("packet built with all-zero key", forged,
          rx.verify_and_decrypt(forged))
-    show("16 random bytes", os.urandom(AIR_LEN),
-         rx.verify_and_decrypt(os.urandom(AIR_LEN)))
+    random_payload = os.urandom(AIR_LEN)
+    show("16 random bytes", random_payload,
+         rx.verify_and_decrypt(random_payload))
 
     # ----- 5. Real traffic still works after all the attacks ---------------
     banner(5, "Legitimate traffic still works after the attacks")

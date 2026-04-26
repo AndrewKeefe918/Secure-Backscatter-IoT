@@ -139,7 +139,7 @@ NCC_EXIT_THRESHOLD = 0.07
 NCC_ENTER_FRAMES = 2
 NCC_EXIT_FRAMES = 8
 # Keep authenticated status visible between packet bursts.
-PACKET_STATUS_HOLD_FRAMES = 180
+PACKET_STATUS_HOLD_FRAMES = 60
 
 # ---- Debugging --------------------------------------------------------------
 TERMINAL_DEBUG_BITS_EVERY = 240

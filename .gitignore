@@ -148,6 +148,14 @@ Release/
 *.raw
 *.bin
 
+# Live receiver runtime artifacts
+receiver/captures/
+receiver/captures/*.ndjson
+receiver/captures/*.json
+
+# Local clangd metadata
+BackscatterTag/.clangd
+
 # Logs
 *.log
 logs/
