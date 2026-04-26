@@ -89,6 +89,10 @@ tampering, and forgery outcomes without needing SDR hardware.
 
 ## MSP firmware
 
+<p align="center">
+  <img src="documents/circuit.png" alt="BackscatterTag circuit diagram" />
+</p>
+
 The matching MSP430 secure firmware is in `BackscatterTag/Msp_FSK_secure.c`.
 It drives Timer_A0 with two
 different CCR0 values per bit:
