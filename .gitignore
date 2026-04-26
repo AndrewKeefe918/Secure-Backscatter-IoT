@@ -62,7 +62,6 @@ Blink LED/Debug/
 
 # Captures, screenshots, dumps
 *.npz
-*.png
 *.jpg
 
 # Large text copies of vendor PDFs (keep local, not in repo)
