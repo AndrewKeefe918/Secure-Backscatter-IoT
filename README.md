@@ -25,6 +25,26 @@ python -m receiver.rx_monitor
 python -m receiver.demo_attacks
 ```
 
+## Exciter runtime and functions
+
+The CW exciter lives in `exciter/pluto_exciter.py` and is intended to run on
+the Raspberry Pi host connected to the transmit Pluto.
+
+Primary functions:
+- `make_waveform(buffer_len, iq_amplitude)`: builds a constant complex IQ
+  vector used as a cyclic TX buffer (pure CW at TX LO).
+- `main()`: configures Pluto TX (`tx_lo`, sample rate, gain, RF bandwidth,
+  cyclic buffer), starts continuous transmission, and handles clean shutdown on
+  SIGINT/SIGTERM.
+
+Operational notes:
+- The file uses `FREQ_HZ = 2.48e9` and must stay aligned with receiver LO
+  configuration in `receiver/config.py`.
+- `TX_GAIN_DB` and `IQ_AMPLITUDE` set excitation strength; increase gain
+  carefully to avoid overdriving near-field setups.
+- For always-on deployment, the systemd setup is documented in
+  `exciter/pluto_exciter_service.txt`.
+
 ## Deployment workflow
 
 Use this sequence for normal bring-up and operation:
@@ -68,6 +88,22 @@ different CCR0 values per bit:
 - `CCR0 = 293` for the '0' bit (1.7 kHz subcarrier)
 - Different tick counts per bit (100 for '1', 170 for '0') keep
   wall-clock bit duration constant at 50 ms.
+
+Key MSP430 functions in `Msp_FSK_secure.c`:
+- `counter_init()`: loads the persisted monotonic counter from flash and
+  advances it by `COUNTER_PERSIST_INTERVAL` to stay monotonic across resets.
+- `counter_next()`: returns the current on-air counter and increments state;
+  periodically checkpoints to flash.
+- `build_packet()`: constructs `AA || 7E || counter || AES-CTR(ciphertext) ||
+  CMAC[0:8]`.
+- `transmit_bit()` and `transmit_byte()`: emit FSK symbols by switching
+  `TA0CCR0` and waiting the correct tick count per symbol.
+- `transmit_packet()`: sends the complete packet MSB-first and toggles LED
+  indication during transmission.
+- `subcarrier_enable()` / `subcarrier_disable()`: gate Timer_A0 output and RF
+  backscatter path depending on reed-switch state.
+- `main()`: initializes clock/GPIO/crypto, then loops on reed-switch state to
+  build/transmit packets with an inter-packet gap.
 
 The live receiver security path is implemented in `receiver/secure_packet.py`
 and configured in `receiver/config.py`.
