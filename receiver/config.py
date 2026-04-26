@@ -53,19 +53,14 @@ LIVE_DECODE_MAX_WEAK_BITS = 2
 LIVE_DECODE_MAX_PAYLOAD_BYTES = 24
 
 # ---- Display / spectrum -----------------------------------------------------
-TIME_SAMPLES = 1200
 SPECTRUM_SPAN_HZ = 150000.0
 FFT_AVG_ALPHA = 0.1
 EXCITER_SEARCH_MIN_HZ = 500.0
 EXCITER_SEARCH_MAX_HZ = 40000.0
 CENTERED_SPAN_HZ = 8000.0
 WATERFALL_ROWS = 120
-WATERFALL_BINS = 512
 WATERFALL_DYN_RANGE_DB = 28.0
 DC_BLOCK_ALPHA = 0.9998
-RX_RF_BANDWIDTH = 200_000
-ENABLE_FOCUSED_FILTER = False
-FOCUSED_PASSBAND_HZ = 2500.0
 CENTERED_FREQ_SMOOTH_BINS = 3
 WATERFALL_ROW_BLEND = 0.75
 
@@ -104,10 +99,6 @@ MAJORITY_ONES_THRESHOLD = (REPETITION_CHIPS // 2) + 1
 
 # ---- Demod display ----------------------------------------------------------
 DEMOD_FILTER_PASSBAND_HZ = 3500.0  # wide enough to pass both 1 kHz and 1.7 kHz
-DEMOD_ENV_SMOOTH_SAMPLES = 48
-CHIP_VIEW_HISTORY = 96             # chips shown in the demod panel
-ENV_Y_SMOOTH_ALPHA = 0.15
-ENV_Y_MIN_SPAN = 0.01
 
 # ---- Packet structure -------------------------------------------------------
 # Msp_FSK_secure.c: preamble 0xAA, sync 0x7E, then 16 payload bytes:
@@ -118,7 +109,6 @@ SYNC_BYTES = b"\x7E"
 PAYLOAD_BYTES = b"OPEN"              # expected plaintext after decryption
 ALLOW_INVERTED_PAYLOAD_MATCH = False  # not applicable in secure mode (MAC is the check)
 PACKET_DECODE_ENABLED = True
-RENDER_PLOTS = False
 
 # ---- Security (AES-128-CTR + AES-CMAC + monotonic replay counter) -----------
 # SHARED_KEY_HEX must match SHARED_KEY[] in Msp_FSK_secure.c byte-for-byte.

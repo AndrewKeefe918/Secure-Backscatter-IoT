@@ -32,7 +32,7 @@ def main() -> int:
         sdr.rx_hardwaregain_chan0 = float(config.RX_GAIN_DB)
 
     # ---- Receiver loop (RX-only, no GUI on hot path) ------------------------
-    from .receiver_loop_rx_only import ReceiverLoopRxOnly
+    from .receiver_loop import ReceiverLoopRxOnly
 
     loop = ReceiverLoopRxOnly(sdr)
 

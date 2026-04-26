@@ -159,8 +159,17 @@ def analyze_live_decode(
                             # windows the same physical packet can appear at slightly
                             # different header indices across frames; position-based keys
                             # would re-verify and trigger replay rejects on duplicates.
+                            # However, once the receiver has accepted a newer packet
+                            # (last_counter has advanced), evict stale valid entries so
+                            # that a genuine replay of an older packet calls
+                            # verify_and_decrypt() and is correctly REJECTED.
                             cache_key = payload
                             cache_hit = cache_key in verified
+                            if cache_hit:
+                                cached = verified[cache_key]
+                                if cached.valid and cached.counter < rx.last_counter:
+                                    del verified[cache_key]
+                                    cache_hit = False
                             if not cache_hit:
                                 verified[cache_key] = rx.verify_and_decrypt(payload)
                             result = verified[cache_key]

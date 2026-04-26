@@ -1,0 +1,32 @@
+[Unit]
+Description=Pluto Exciter
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/pluto_exciter.py
+WorkingDirectory=/home/pi
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target
+
+
+
+# 1) Open the service file for editing:
+#    sudo nano /etc/systemd/system/exciter.service
+#    In nano: Ctrl+O writes/saves, Ctrl+X exits.
+#
+# 2) Reload systemd manager configuration after file changes:
+#    sudo systemctl daemon-reload
+#
+# 3) Enable the exciter service at boot:
+#    sudo systemctl enable exciter.service
+#
+# 4) Start the exciter service now:
+#    sudo systemctl start exciter.service
+#
+# 5) Verify service state/log summary:
+#    sudo systemctl status exciter.service
