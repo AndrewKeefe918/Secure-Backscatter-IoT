@@ -25,6 +25,10 @@ python -m receiver.rx_monitor
 python -m receiver.demo_attacks
 ```
 
+## Video demo
+
+[![Watch the RX + RX monitor demo](https://img.youtube.com/vi/rRYwHWMTVfA/hqdefault.jpg)](https://youtu.be/rRYwHWMTVfA)
+
 ## Exciter runtime and functions
 
 The CW exciter lives in `exciter/pluto_exciter.py` and is intended to run on
