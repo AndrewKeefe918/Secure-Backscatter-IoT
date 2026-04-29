@@ -46,6 +46,12 @@ python -m receiver.demo_attacks
   </a>
 </p>
 
+## Hardware setup
+
+| Door open (tag transmitting) | Door shut (tag silent) |
+|:---:|:---:|
+| ![Door open setup](documents/pictures/Door_open_setup.jpeg) | ![Door shut setup](documents/pictures/Door_shut_Setup.jpeg) |
+
 ## Exciter runtime and functions
 
 The CW exciter lives in `exciter/pluto_exciter.py` and is intended to run on
@@ -94,6 +100,38 @@ python -m receiver.demo_attacks
 `receiver/secure_packet.py` and demonstrates outcomes for legitimate
 traffic, replay, tampering, and forgery attacks.
 
+## Live operation screenshots
+
+### Continuous transmission — door open
+
+Tag is actively transmitting. SNR climbs above the lock threshold, FSK
+sidebands are visible at ±1 kHz and ±1.7 kHz in the carrier-centered view,
+and the receiver authenticates each packet.
+
+| RX Monitor | Terminal |
+|:---:|:---:|
+| ![RX monitor — door open](documents/pictures/Door_open_rx_monitor.PNG) | ![Terminal — door open](documents/pictures/Door_open_terminal.PNG) |
+
+### Tag silent — door shut
+
+Reed switch grounded: tag stops modulating. SNR drops below the lock
+threshold and no sideband bumps appear. The receiver shows the last
+authenticated packet in a held state.
+
+| RX Monitor | Terminal |
+|:---:|:---:|
+| ![RX monitor — door shut](documents/pictures/Door_shut_rx_monitor.PNG) | ![Terminal — door shut](documents/pictures/Door_shut_terminal.PNG) |
+
+### Single transmission — open then shut
+
+SNR profile in the signal-quality panel ramps up as the tag begins
+transmitting, the receiver locks and decodes one authenticated packet,
+then SNR returns to baseline when the reed switch closes.
+
+| RX Monitor | Terminal |
+|:---:|:---:|
+| ![RX monitor — single transmission](documents/pictures/Single_transmission_rx_monitor_open_shut.PNG) | ![Terminal — single transmission](documents/pictures/Single_transmission_terminal.PNG) |
+
 ## FSK vs. OOK Design Rationale
 
 - **Chip decision**: differential metric (`m_f1` vs `m_f0`) instead of absolute thresholding.
@@ -106,7 +144,7 @@ traffic, replay, tampering, and forgery attacks.
 ## MSP firmware
 
 <p align="center">
-  <img src="documents/circuit.png" alt="BackscatterTag circuit diagram" />
+  <img src="documents/pictures/circuit.png" alt="BackscatterTag circuit diagram" />
 </p>
 
 The matching MSP430 secure firmware is in `BackscatterTag/Msp_FSK_secure.c`.
