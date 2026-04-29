@@ -32,12 +32,16 @@ class MonitorState:
         self.proc_ms = deque(maxlen=history_len)
         self.gap_ms = deque(maxlen=history_len)
         self.cfo_hz = deque(maxlen=history_len)
-        self.ncc = deque(maxlen=history_len)
         self.snr_db: deque[float] = deque(maxlen=history_len)
         self.locked: bool = False
         self.monitor_axis_khz = np.array([], dtype=np.float64)
+        self.monitor_raw_row_dbfs = np.array([], dtype=np.float64)
         self.monitor_row_dbfs = np.array([], dtype=np.float64)
         self.monitor_waterfall = np.full((config.WATERFALL_ROWS, 1), -140.0, dtype=np.float64)
+        # Smoothed waterfall noise floor (dBFS); refreshed every
+        # WATERFALL_AUTOSCALE_EVERY_N frames to keep the per-frame update cheap.
+        self.wf_nf_ema: float | None = None
+        self.wf_autoscale_counter: int = 0
         self.capture_offset = 0
         self.chips_by_phase: dict[int, list[int]] = defaultdict(list)
         self.last_announced_bit: dict[tuple[int, int], int] = {}
@@ -101,7 +105,7 @@ def _update_live_decode(state: MonitorState) -> None:
         key = (phase, decode_offset)
         if header_idx > state.last_announced_bit.get(key, -1):
             state.last_announced_bit[key] = header_idx
-            label = "AUTHENTICATED" if config.SECURE_MODE else "PKT"
+            label = "AUTHENTICATED"
             state.packet_events.appendleft(f"{label} phase={phase} off={decode_offset} bit={header_idx}")
 
 
@@ -130,15 +134,38 @@ def main() -> int:
         dtype=np.float64,
     )
     state.monitor_axis_khz = default_axis_khz
+    state.monitor_raw_row_dbfs = np.full_like(default_axis_khz, -140.0)
     state.monitor_row_dbfs = np.full_like(default_axis_khz, -140.0)
-    state.monitor_waterfall = np.full((config.WATERFALL_ROWS, default_axis_khz.size), -140.0, dtype=np.float64)
-
-    fig, (ax_centered, ax_waterfall, ax_quality, ax_bits) = plt.subplots(
-        4, 1, figsize=(11, 11), gridspec_kw={"height_ratios": [2, 2.5, 1.5, 1.5]}
+    # Waterfall uses an oversampled display axis (cheap np.interp per row);
+    # transported spectrum size is unchanged.
+    wf_oversample = max(1, int(getattr(config, "WATERFALL_DISPLAY_OVERSAMPLE", 1)))
+    wf_axis_khz = (
+        default_axis_khz
+        if wf_oversample == 1
+        else np.linspace(
+            default_axis_khz[0],
+            default_axis_khz[-1],
+            default_axis_khz.size * wf_oversample,
+            dtype=np.float64,
+        )
     )
-    fig.subplots_adjust(top=0.93, bottom=0.10, hspace=0.82)
+    state.monitor_waterfall = np.full((config.WATERFALL_ROWS, wf_axis_khz.size), -140.0, dtype=np.float64)
+
+    fig, (ax_raw, ax_centered, ax_waterfall, ax_quality, ax_bits) = plt.subplots(
+        5, 1, figsize=(11, 13), gridspec_kw={"height_ratios": [2, 2, 2.5, 1.5, 1.5]}
+    )
+    fig.subplots_adjust(top=0.94, bottom=0.08, hspace=0.78)
     fig.canvas.manager.set_window_title("FSK RX Monitor")
     fig.suptitle("FSK RX Monitor \u2014 spectrum \u00b7 waterfall \u00b7 signal quality \u00b7 decode")
+
+    (line_raw,) = ax_raw.plot(default_axis_khz, state.monitor_raw_row_dbfs, lw=1.2, color="C7")
+    ax_raw.axvline(0.0, color="C3", lw=1.0, alpha=0.8)
+    raw_peak_line = ax_raw.axvline(0.0, color="C0", lw=1.0, alpha=0.8, linestyle="--")
+    ax_raw.set_title("Raw Spectrum (DC-Referenced)", pad=10)
+    ax_raw.set_ylabel("Magnitude (dBFS)")
+    ax_raw.set_xlim(default_axis_khz[0], default_axis_khz[-1])
+    ax_raw.set_ylim(-120.0, -60.0)
+    ax_raw.grid(True, alpha=0.3)
 
     (line_centered,) = ax_centered.plot(default_axis_khz, state.monitor_row_dbfs, lw=1.2, color="C0")
     ax_centered.axvline(0.0, color="C3", lw=1.0, alpha=0.8)
@@ -146,9 +173,9 @@ def main() -> int:
     ax_centered.axvline(-config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.9, alpha=0.7, linestyle="--")
     ax_centered.axvline(config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.9, alpha=0.7, linestyle="--")
     ax_centered.axvline(-config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.9, alpha=0.7, linestyle="--")
-    ax_centered.set_title("Carrier-Centered Spectrum", pad=10)
+    ax_centered.set_title("Carrier-Centered Spectrum  (±3 kHz sideband zoom)", pad=10)
     ax_centered.set_ylabel("Magnitude (dBFS)")
-    ax_centered.set_xlim(default_axis_khz[0], default_axis_khz[-1])
+    ax_centered.set_xlim(-3.0, 3.0)  # zoom to sideband region; DC artifact is at ±7.4 kHz
     ax_centered.set_ylim(-120.0, -60.0)
     ax_centered.grid(True, alpha=0.3)
 
@@ -156,14 +183,15 @@ def main() -> int:
         state.monitor_waterfall,
         aspect="auto",
         origin="lower",
-        extent=[default_axis_khz[0], default_axis_khz[-1], 0, config.WATERFALL_ROWS],
+        extent=[wf_axis_khz[0], wf_axis_khz[-1], 0, config.WATERFALL_ROWS],
         cmap="plasma",
         vmin=-120.0,
         vmax=-80.0,
         interpolation="nearest",
     )
-    ax_waterfall.set_title("Carrier-Centered Waterfall", pad=10)
+    ax_waterfall.set_title("Carrier-Centered Waterfall  (±3 kHz sideband zoom)", pad=10)
     ax_waterfall.set_ylabel("Snapshot")
+    ax_waterfall.set_xlim(-3.0, 3.0)  # match the spectrum zoom
     ax_waterfall.axvline(config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.8, alpha=0.6, linestyle="--")
     ax_waterfall.axvline(-config.SIDEBAND_OFFSET_KHZ, color="lime", lw=0.8, alpha=0.6, linestyle="--")
     ax_waterfall.axvline(config.SIDEBAND_OFFSET_F0_KHZ, color="orange", lw=0.8, alpha=0.6, linestyle="--")
@@ -224,49 +252,197 @@ def main() -> int:
     )
 
     status_text = fig.text(0.01, 0.01, "Waiting for RX status...", ha="left", va="bottom", family="Consolas")
+    measure_hint_text = fig.text(
+        0.99,
+        0.01,
+        "Measure: OFF  (press m to toggle)",
+        ha="right",
+        va="bottom",
+        family="Consolas",
+        fontsize=8,
+        color="0.35",
+    )
+
+    measure: dict[str, object] = {
+        "enabled": False,
+        "points": [],  # list[(axis, x_khz, y_dbfs)]
+        "artists": [],
+    }
+
+    def _clear_measure_artists() -> None:
+        artists = measure["artists"]
+        if isinstance(artists, list):
+            for artist in artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+            artists.clear()
+
+    def _redraw_measure_overlay() -> None:
+        _clear_measure_artists()
+        points = measure["points"]
+        if not isinstance(points, list) or not points:
+            fig.canvas.draw_idle()
+            return
+
+        artists = measure["artists"]
+        for ax, xk, yd in points:
+            mark = ax.plot([xk], [yd], marker="o", ms=5, color="yellow", mec="black", mew=0.6, zorder=10)[0]
+            artists.append(mark)
+
+        if len(points) >= 2:
+            ax0, x0, y0 = points[0]
+            ax1, x1, y1 = points[1]
+            if ax0 is ax1:
+                line = ax0.plot([x0, x1], [y0, y1], color="yellow", lw=1.0, alpha=0.9, zorder=9)[0]
+                df_hz = (x1 - x0) * 1000.0
+                dy_db = y1 - y0
+                label = f"Δf={df_hz:+.1f} Hz  Δmag={dy_db:+.2f} dB"
+                xm = 0.5 * (x0 + x1)
+                ym = max(y0, y1) + 1.0
+                txt = ax0.text(
+                    xm,
+                    ym,
+                    label,
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    family="Consolas",
+                    color="yellow",
+                    bbox={"boxstyle": "round,pad=0.2", "fc": "black", "ec": "yellow", "alpha": 0.75},
+                    zorder=10,
+                )
+                artists.extend([line, txt])
+
+        fig.canvas.draw_idle()
+
+    def _on_key(event: object) -> None:
+        key = getattr(event, "key", "")
+        if key == "m":
+            measure["enabled"] = not bool(measure["enabled"])
+            if not bool(measure["enabled"]):
+                measure["points"] = []
+                _clear_measure_artists()
+                measure_hint_text.set_text("Measure: OFF  (press m to toggle)")
+            else:
+                measure_hint_text.set_text("Measure: ON  (left click x2, right click clear)")
+            fig.canvas.draw_idle()
+        elif key in ("c", "escape"):
+            measure["points"] = []
+            _clear_measure_artists()
+            fig.canvas.draw_idle()
+
+    def _on_click(event: object) -> None:
+        if not bool(measure["enabled"]):
+            return
+        ax = getattr(event, "inaxes", None)
+        if ax not in (ax_raw, ax_centered):
+            return
+        xdata = getattr(event, "xdata", None)
+        ydata = getattr(event, "ydata", None)
+        if xdata is None or ydata is None:
+            return
+
+        button = getattr(event, "button", None)
+        if button == 3:
+            measure["points"] = []
+            _clear_measure_artists()
+            fig.canvas.draw_idle()
+            return
+        if button != 1:
+            return
+
+        points = measure["points"]
+        if not isinstance(points, list):
+            return
+
+        # Keep measurements on a single spectrum panel at a time.
+        if points and points[0][0] is not ax:
+            points.clear()
+        if len(points) >= 2:
+            points.clear()
+        points.append((ax, float(xdata), float(ydata)))
+        _redraw_measure_overlay()
+
+    fig.canvas.mpl_connect("key_press_event", _on_key)
+    fig.canvas.mpl_connect("button_press_event", _on_click)
 
     def _update(_frame: int):
         status = _read_status(status_path)
         _read_new_capture(capture_path, state)
         _update_live_decode(state)
         if status is None:
-            return line_centered, waterfall_img, line_bits, bits_text, status_text
+            return line_raw, raw_peak_line, line_centered, waterfall_img, line_bits, bits_text, status_text
 
         frame = int(status.get("frame", 0))
         if state.frames and frame == state.frames[-1]:
-            return line_centered, waterfall_img, line_bits, bits_text, status_text
+            return line_raw, raw_peak_line, line_centered, waterfall_img, line_bits, bits_text, status_text
 
         state.frames.append(frame)
         state.rx_ms.append(float(status.get("rx_ms", 0.0)))
         state.proc_ms.append(float(status.get("proc_ms", 0.0)))
         state.gap_ms.append(float(status.get("gap_ms", 0.0)))
         state.cfo_hz.append(float(status.get("cfo_hz", 0.0)))
-        state.ncc.append(float(status.get("ncc_ema", 0.0)))
+
+        raw_row_vals = np.asarray(status.get("monitor_raw_row_dbfs", []), dtype=np.float64)
+        if raw_row_vals.size == state.monitor_axis_khz.size:
+            state.monitor_raw_row_dbfs = raw_row_vals
+            line_raw.set_data(state.monitor_axis_khz, state.monitor_raw_row_dbfs)
+            peak_hz = float(status.get("peak_hz", 0.0))
+            raw_peak_line.set_xdata([peak_hz / 1000.0, peak_hz / 1000.0])
+            raw_noise_floor = float(np.percentile(state.monitor_raw_row_dbfs, 20))
+            raw_peak = float(np.max(state.monitor_raw_row_dbfs)) if state.monitor_raw_row_dbfs.size else -60.0
+            ax_raw.set_ylim(raw_noise_floor - 6.0, max(raw_noise_floor + 10.0, raw_peak + 4.0))
 
         row_vals = np.asarray(status.get("monitor_row_dbfs", []), dtype=np.float64)
         if row_vals.size == state.monitor_axis_khz.size:
             state.monitor_row_dbfs = row_vals
             line_centered.set_data(state.monitor_axis_khz, state.monitor_row_dbfs)
 
+            # Interpolate transported spectrum onto the finer waterfall axis.
+            if wf_oversample == 1:
+                wf_row = row_vals
+            else:
+                wf_row = np.interp(wf_axis_khz, state.monitor_axis_khz, row_vals)
+
             state.monitor_waterfall[:-1] = state.monitor_waterfall[1:]
             if config.WATERFALL_ROWS > 1:
-                row_vals = (
-                    config.WATERFALL_ROW_BLEND * row_vals
+                wf_row = (
+                    config.WATERFALL_ROW_BLEND * wf_row
                     + (1.0 - config.WATERFALL_ROW_BLEND) * state.monitor_waterfall[-2]
                 )
-            state.monitor_waterfall[-1] = row_vals
+            state.monitor_waterfall[-1] = wf_row
             waterfall_img.set_data(state.monitor_waterfall)
 
             noise_floor = float(status.get("monitor_noise_floor_dbfs", -120.0))
-            row_peak = float(np.max(state.monitor_row_dbfs)) if state.monitor_row_dbfs.size else -60.0
+            # Peak inside the ±3 kHz zoom only (excludes the DC artifact at ±7.4 kHz).
+            zoom_mask = np.abs(state.monitor_axis_khz) <= 3.0
+            if np.any(zoom_mask) and state.monitor_row_dbfs.size:
+                row_peak = float(np.max(state.monitor_row_dbfs[zoom_mask]))
+            else:
+                row_peak = -60.0
             ax_centered.set_ylim(noise_floor - 6.0, max(noise_floor + 10.0, row_peak + 4.0))
 
-            wf_axis_mask = np.abs(state.monitor_axis_khz) > 0.5
-            valid = state.monitor_waterfall[:, wf_axis_mask] if np.any(wf_axis_mask) else state.monitor_waterfall
-            valid = valid[valid > -139.0]
-            if valid.size:
-                nf = float(np.percentile(valid, 15))
-                waterfall_img.set_clim(vmin=nf - 1.0, vmax=nf + config.WATERFALL_DYN_RANGE_DB)
+            # Waterfall clim: refresh percentile every N frames, EMA-smoothed,
+            # so set_clim() stays off the hot path. Mask excludes carrier DC.
+            state.wf_autoscale_counter += 1
+            if state.wf_autoscale_counter >= int(config.WATERFALL_AUTOSCALE_EVERY_N):
+                state.wf_autoscale_counter = 0
+                wf_axis_mask = (np.abs(wf_axis_khz) > 0.5) & (np.abs(wf_axis_khz) <= 3.0)
+                valid = state.monitor_waterfall[:, wf_axis_mask] if np.any(wf_axis_mask) else state.monitor_waterfall
+                valid = valid[valid > -139.0]
+                if valid.size:
+                    nf_sample = float(np.percentile(valid, 15))
+                    if state.wf_nf_ema is None:
+                        state.wf_nf_ema = nf_sample
+                    else:
+                        a = float(config.WATERFALL_NF_EMA_ALPHA)
+                        state.wf_nf_ema = a * nf_sample + (1.0 - a) * state.wf_nf_ema
+                    waterfall_img.set_clim(
+                        vmin=state.wf_nf_ema - 1.0,
+                        vmax=state.wf_nf_ema + config.WATERFALL_DYN_RANGE_DB,
+                    )
 
         locked = bool(int(status.get("lock", 0)))
         state.locked = locked
@@ -335,11 +511,11 @@ def main() -> int:
         status_text.set_color("#1b5e20" if locked else "#e65100")
         status_text.set_text(
             f"frame={status.get('frame')}  {lock_text}  phase={status.get('best_phase')}  chips={status.get('chips_seen')}  "
-            f"peak={status.get('peak_hz')} Hz  CFO={status.get('cfo_hz')} Hz  NCC={status.get('ncc_ema')}  late={late}  slips={slips}\n"
+            f"peak={status.get('peak_hz')} Hz  CFO={status.get('cfo_hz')} Hz  late={late}  slips={slips}\n"
             f"sidebands: snr={snr_val:.1f} dB  +1k={sb_pos} dBFS  -1k={sb_neg} dBFS  rx/proc/gap={status.get('rx_ms')}/{status.get('proc_ms')}/{status.get('gap_ms')} ms\n"
             f"events={events_text}"
         )
-        return line_centered, waterfall_img, line_bits, bits_text, status_text
+        return line_raw, raw_peak_line, line_centered, waterfall_img, line_bits, bits_text, status_text
 
     _anim = FuncAnimation(fig, _update, interval=250, blit=False, cache_frame_data=False)
     plt.show()

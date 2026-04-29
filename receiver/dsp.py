@@ -1,8 +1,8 @@
 ﻿"""DSP utility functions for backscatter signal processing â€” FSK version.
 
-Adds coherent_fsk_metrics() to the OOK toolkit; everything else is
-preserved verbatim from the OOK code so the spectrum, waterfall, and
-carrier-tracking machinery continues to work.
+Kept lean for the realtime path. The chip-level decision is
+coherent_fsk_metrics_cached(); higher-level helpers feed peak tracking,
+spectrum display, and CFO correction.
 """
 
 import numpy as np
@@ -14,10 +14,6 @@ from . import config as config
 def normalize_iq(raw: object) -> np.ndarray:
     samples = np.asarray(raw, dtype=np.complex64)
     return samples / np.float32(config.ADC_FULL_SCALE)
-
-
-def remove_dc(x: np.ndarray) -> np.ndarray:
-    return x - np.mean(x)
 
 
 def dc_block_filter(
@@ -60,93 +56,34 @@ def compute_sideband_snr(
     return snr, sb_pos, sb_neg, noise_floor
 
 
-def coherent_ncc(
+def coherent_fsk_metrics_cached(
     x: np.ndarray,
-    carrier_hz: float,
-    mod_hz: float,
-    sample_rate: float,
-) -> tuple[float, np.ndarray]:
-    """Coherent AM demodulation + NCC against a square-wave reference.
-
-    Used for the carrier-tracking display in the GUI; the FSK chip
-    decisions use coherent_fsk_metrics() below.
-    """
-    n = np.arange(len(x), dtype=np.float64)
-    mix = np.exp(-1j * 2.0 * np.pi * carrier_hz * n / sample_rate)
-    baseband = x.astype(np.complex128) * mix
-    envelope = np.abs(baseband).astype(np.float64)
-    envelope -= envelope.mean()
-    ref = np.sign(np.sin(2.0 * np.pi * mod_hz * n / sample_rate))
-    env_rms = float(np.sqrt(np.mean(envelope ** 2)))
-    ref_rms = float(np.sqrt(np.mean(ref ** 2)))
-    if env_rms < 1e-12 or ref_rms < 1e-12:
-        return 0.0, envelope
-    ncc = float(np.mean(envelope * ref) / (env_rms * ref_rms))
-    return ncc, envelope
-
-
-def coherent_chip_metric(
-    x: np.ndarray,
-    carrier_hz: float,
-    mod_hz: float,
-    sample_rate: float,
-) -> float:
-    """Phase-invariant subcarrier presence metric in [0, ~1].
-
-    Magnitude of the discrete Fourier coefficient at mod_hz, normalised
-    by the envelope RMS. Used as a building block by coherent_fsk_metrics.
-    """
-    if x.size == 0:
-        return 0.0
-    n = np.arange(x.size, dtype=np.float64)
-    mix = np.exp(-1j * 2.0 * np.pi * float(carrier_hz) * n / float(sample_rate))
-    envelope = np.abs(x.astype(np.complex128) * mix)
-    envelope -= envelope.mean()
-    env_rms = float(np.sqrt(np.mean(envelope ** 2)))
-    if env_rms < 1e-12:
-        return 0.0
-    ref = np.exp(-1j * 2.0 * np.pi * float(mod_hz) * n / float(sample_rate))
-    coeff = complex(np.mean(envelope * ref))
-    return float(np.sqrt(2.0) * abs(coeff) / env_rms)
-
-
-def coherent_fsk_metrics(
-    x: np.ndarray,
-    carrier_hz: float,
-    f1_hz: float,
-    f0_hz: float,
-    sample_rate: float,
+    mix_c64: np.ndarray,
+    ref_f1_c64: np.ndarray,
+    ref_f0_c64: np.ndarray,
 ) -> tuple[float, float, float]:
-    """Coherent dual-frequency FSK detection.
+    """Coherent FSK chip metric with caller-supplied complex64 references.
 
-    Mixes the carrier to DC, takes the AM envelope, and computes the
-    magnitude of the discrete Fourier coefficient at each of the two
-    subcarrier frequencies. Returns (m_f1, m_f0, decision) where
-    decision = m_f1 - m_f0; positive means '1', negative means '0'.
-
-    The decision is self-normalising â€” comparing m_f1 to m_f0 eliminates
-    the need for an absolute threshold. This is the main reason FSK is
-    more robust than OOK on a marginal-SNR channel.
+    Caller supplies the carrier->DC mix and the f1/f0 reference vectors;
+    all inputs share the chip length. Avoids three np.exp() rebuilds per
+    chip and stays in complex64 to halve memory bandwidth vs float64.
     """
     if x.size == 0:
         return 0.0, 0.0, 0.0
-    n = np.arange(x.size, dtype=np.float64)
-    mix = np.exp(-1j * 2.0 * np.pi * float(carrier_hz) * n / float(sample_rate))
-    envelope = np.abs(x.astype(np.complex128) * mix)
+    # Carrier mix to DC, then real envelope.
+    bb = x.astype(np.complex64, copy=False) * mix_c64
+    envelope = np.abs(bb).astype(np.float32)
     envelope -= envelope.mean()
-    env_rms = float(np.sqrt(np.mean(envelope ** 2)))
-    if env_rms < 1e-12:
+    env_rms = float(np.sqrt(np.mean(envelope * envelope)))
+    if env_rms < 1e-9:
         return 0.0, 0.0, 0.0
-
-    ref_f1 = np.exp(-1j * 2.0 * np.pi * float(f1_hz) * n / float(sample_rate))
-    ref_f0 = np.exp(-1j * 2.0 * np.pi * float(f0_hz) * n / float(sample_rate))
-
-    # sqrt(2) compensates for the half-power split between +/- frequency bins.
-    m_f1 = float(np.sqrt(2.0) * abs(complex(np.mean(envelope * ref_f1))) / env_rms)
-    m_f0 = float(np.sqrt(2.0) * abs(complex(np.mean(envelope * ref_f0))) / env_rms)
-
-    decision = m_f1 - m_f0
-    return m_f1, m_f0, decision
+    # complex64 dot products instead of mean()-of-elementwise-product.
+    inv_n = 1.0 / float(envelope.size)
+    coeff_f1 = complex(np.dot(envelope, ref_f1_c64)) * inv_n
+    coeff_f0 = complex(np.dot(envelope, ref_f0_c64)) * inv_n
+    m_f1 = float(np.sqrt(2.0) * abs(coeff_f1) / env_rms)
+    m_f0 = float(np.sqrt(2.0) * abs(coeff_f0) / env_rms)
+    return m_f1, m_f0, m_f1 - m_f0
 
 
 def estimate_residual_cfo_hz(x: np.ndarray, sample_rate: float) -> float:
@@ -203,30 +140,6 @@ def compute_spectrum_dbfs(x: np.ndarray, sample_rate: float) -> tuple[np.ndarray
     return freqs, spectrum_dbfs
 
 
-def bandpass_filter_around_carrier(
-    x: np.ndarray,
-    carrier_hz: float,
-    sample_rate: float,
-    passband_hz: float = 2000.0,
-) -> np.ndarray:
-    """Carrier-centered filter using heterodyne + low-pass + heterodyne."""
-    if passband_hz <= 0.0 or len(x) == 0:
-        return x
-    nyquist = sample_rate / 2.0
-    wn = min(passband_hz / nyquist, 0.99)
-    if wn <= 0.0:
-        return x
-    n = np.arange(len(x), dtype=np.float64)
-    w = 2.0 * np.pi * float(carrier_hz) / float(sample_rate)
-    downmix = np.exp(-1j * w * n)
-    upmix = np.exp(1j * w * n)
-    x_shifted = x.astype(np.complex128) * downmix
-    sos = sp.butter(4, wn, btype="lowpass", output="sos")
-    y_shifted = sp.sosfilt(sos, x_shifted)
-    y = y_shifted * upmix
-    return y.astype(np.complex64)
-
-
 def ema_spectrum_power_domain(
     current_dbfs: np.ndarray,
     previous_dbfs: np.ndarray,
@@ -246,18 +159,41 @@ def find_exciter_peak(
     freqs_hz: np.ndarray,
     spectrum_dbfs: np.ndarray,
     in_view_mask: np.ndarray,
-    prev_peak_hz: float,
+    prev_peak_hz: float | None,
     search_min_hz: float,
     search_max_hz: float,
-    snr_keep_db: float = 10.0,
+    snr_keep_db: float = 6.0,
+    expected_hz: float | None = None,
+    expected_tol_hz: float = 0.0,
+    strict_expected_band: bool = False,
+    max_step_hz: float = 0.0,
+    switch_margin_db: float = 0.0,
 ) -> tuple[float, float]:
-    """Locate the exciter carrier with sticky tracking."""
-    search_mask = (np.abs(freqs_hz) >= search_min_hz) & (np.abs(freqs_hz) <= search_max_hz)
+    """Locate the exciter carrier with sticky tracking.
+
+    Only positive-frequency bins are searched: the exciter always transmits
+    at a positive LO offset (TONE_HZ > 0), so the negative-frequency mirror
+    image is noise / interference and must not win.
+    """
+    search_mask = (freqs_hz >= search_min_hz) & (freqs_hz <= search_max_hz)
     search_view = in_view_mask & search_mask
+    if expected_hz is not None and expected_tol_hz > 0.0:
+        expected_view = np.abs(freqs_hz - float(expected_hz)) <= float(expected_tol_hz)
+        band_view = search_view & expected_view
+        if np.any(band_view):
+            search_view = band_view
+        elif strict_expected_band:
+            if prev_peak_hz is None:
+                return 0.0, -140.0
+            idx = int(np.argmin(np.abs(freqs_hz - prev_peak_hz)))
+            return prev_peak_hz, float(spectrum_dbfs[idx])
+
     exciter_freqs = freqs_hz[search_view]
     exciter_spec = spectrum_dbfs[search_view]
 
     if exciter_spec.size == 0:
+        if prev_peak_hz is None:
+            return 0.0, -140.0
         idx = int(np.argmin(np.abs(freqs_hz - prev_peak_hz)))
         return prev_peak_hz, float(spectrum_dbfs[idx])
 
@@ -266,7 +202,16 @@ def find_exciter_peak(
     cand_dbfs = float(exciter_spec[best])
     noise_ref = float(np.percentile(spectrum_dbfs[in_view_mask], 50))
 
-    if (cand_dbfs - noise_ref) >= snr_keep_db or prev_peak_hz == 0.0:
+    # Anti-jump hysteresis: if the candidate is far from the tracked peak,
+    # only allow switching when it is clearly stronger.
+    if prev_peak_hz is not None and max_step_hz > 0.0:
+        prev_idx = int(np.argmin(np.abs(freqs_hz - prev_peak_hz)))
+        prev_dbfs = float(spectrum_dbfs[prev_idx])
+        if abs(cand_hz - float(prev_peak_hz)) > float(max_step_hz):
+            if cand_dbfs < (prev_dbfs + float(switch_margin_db)):
+                return float(prev_peak_hz), prev_dbfs
+
+    if (cand_dbfs - noise_ref) >= snr_keep_db or prev_peak_hz is None:
         return cand_hz, cand_dbfs
 
     idx = int(np.argmin(np.abs(freqs_hz - prev_peak_hz)))

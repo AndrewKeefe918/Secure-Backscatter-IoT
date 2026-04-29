@@ -23,8 +23,7 @@ Frequency relationship
   Both Plutos must be tuned to the same FREQ_HZ.
   TONE_HZ offsets the exciter from its own LO; the receiver will see
   the reflected carrier at that same offset from its LO.
-  Keep TONE_HZ > 3000 Hz so the receiver's exciter search can find it
-  (EXCITER_SEARCH_MIN_HZ = 3000 in pluto_receiver_gui.py).
+    Keep TONE_HZ well above the receiver's non-DC search floor.
 
 Use Ctrl+C to stop transmission.
 """
@@ -44,24 +43,37 @@ URI = "ip:192.168.2.1"
 # Must match FREQ_HZ in pluto_receiver_gui.py so both radios share the same LO.
 FREQ_HZ = 2.48e9
 
-SAMPLE_RATE = int(2e6)   # 2 MHz — matches original working exciter
+SAMPLE_RATE = int(1e6)   # 1 MHz — must match receiver SAMPLE_RATE in receiver/config.py
 
 # --- TX power ---
-TX_GAIN_DB = -5.0        # matches original working exciter
+TX_GAIN_DB = -5.0         # step up from -15 for stronger backscatter
 
 # Raw IQ amplitude in DAC counts (int16 scale: 2^14 = 16384).
 # The adi library passes these directly to libiio without normalisation.
 IQ_AMPLITUDE = 2 ** 14
 
-BUFFER_LEN = 1024        # matches original working exciter
+BUFFER_LEN = 4096
+# TONE_BIN chosen so TONE_HZ = SAMPLE_RATE * TONE_BIN / BUFFER_LEN = 15625 Hz
+# at fs = 1 MS/s. Must equal EXCITER_EXPECTED_HZ in receiver/config.py.
+TONE_BIN = 64
+TONE_HZ = SAMPLE_RATE * TONE_BIN / BUFFER_LEN  # 15625 Hz, coherent with BUFFER_LEN and clear of DC leakage
+MIN_NON_DC_OFFSET_HZ = 12000.0
 
 
-def make_waveform(buffer_len: int, iq_amplitude: int) -> np.ndarray:
-    """Constant IQ at iq_amplitude — pure CW at TX LO (DC in baseband)."""
-    return np.ones(buffer_len, dtype=np.complex64) * np.complex64(iq_amplitude)
+def make_waveform(buffer_len: int, iq_amplitude: int, tone_hz: float, sample_rate: float) -> np.ndarray:
+    """Generate a cyclic complex tone offset from LO to avoid the DC bin."""
+    n = np.arange(buffer_len, dtype=np.float32)
+    phase = (2.0 * np.pi * float(tone_hz) / float(sample_rate)) * n
+    waveform = np.exp(1j * phase).astype(np.complex64)
+    return waveform * np.complex64(iq_amplitude)
 
 
 def main() -> int:
+    if TONE_HZ < MIN_NON_DC_OFFSET_HZ:
+        raise ValueError(
+            f"TONE_HZ={TONE_HZ:.1f} must be >= {MIN_NON_DC_OFFSET_HZ:.1f} Hz to stay out of the DC bin"
+        )
+
     sdr = adi.Pluto(URI)
     sdr.tx_enabled_channels = [0]
     sdr.sample_rate = int(SAMPLE_RATE)
@@ -70,7 +82,7 @@ def main() -> int:
     sdr.tx_hardwaregain_chan0 = float(TX_GAIN_DB)
     sdr.tx_cyclic_buffer = True
 
-    waveform = make_waveform(BUFFER_LEN, IQ_AMPLITUDE)
+    waveform = make_waveform(BUFFER_LEN, IQ_AMPLITUDE, TONE_HZ, SAMPLE_RATE)
 
     stop_requested = False
 
@@ -84,7 +96,10 @@ def main() -> int:
     print("Starting Pluto exciter with:")
     print(f"  URI         : {URI}")
     print(f"  Freq (Hz)   : {int(FREQ_HZ)}")
+    print(f"  Tone (Hz)   : {TONE_HZ:.1f}")
+    print(f"  RF Out (Hz) : {int(FREQ_HZ + TONE_HZ)}")
     print(f"  SR (SPS)    : {int(SAMPLE_RATE)}")
+    print(f"  Buffer Len  : {BUFFER_LEN}")
     print(f"  TX Gain (dB): {TX_GAIN_DB}")
     print(f"  IQ Amplitude: {IQ_AMPLITUDE}")
 

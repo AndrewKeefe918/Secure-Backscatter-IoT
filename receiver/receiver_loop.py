@@ -15,8 +15,7 @@ import numpy as np
 
 from . import config as config
 from .dsp import (
-    bandpass_filter_around_carrier,
-    coherent_fsk_metrics,
+    coherent_fsk_metrics_cached,
     compute_spectrum_dbfs,
     compute_sideband_snr,
     dc_block_filter,
@@ -50,20 +49,38 @@ class ReceiverLoopRxOnly:
         self.stop_requested = False
 
         self.bit_samples = config.SAMPLES_PER_CHIP
-        self.phase_offsets = [0]
+        phase_step = self.bit_samples // max(1, int(config.PHASE_COUNT))
+        self.phase_offsets = [i * phase_step for i in range(int(config.PHASE_COUNT))]
         self.phase_sample_buffer = np.array([], dtype=np.complex64)
         self.phase_state = {p: PhaseState(next_sample=p) for p in self.phase_offsets}
 
+        # Cached complex64 reference vectors for the chip metric. The two
+        # subcarrier references depend only on bit_samples and SAMPLE_RATE,
+        # so they are built once. The mix-to-DC vector depends on the
+        # tracked peak; rebuild only when peak_hz crosses a coarse grid.
+        n_chip = np.arange(self.bit_samples, dtype=np.float64)
+        two_pi_over_fs = 2.0 * np.pi / float(config.SAMPLE_RATE)
+        self._ref_f1_c64 = np.exp(
+            -1j * two_pi_over_fs * float(config.FSK_F1_HZ) * n_chip
+        ).astype(np.complex64)
+        self._ref_f0_c64 = np.exp(
+            -1j * two_pi_over_fs * float(config.FSK_F0_HZ) * n_chip
+        ).astype(np.complex64)
+        self._chip_mix_c64: np.ndarray | None = None
+        self._chip_mix_peak_hz: float | None = None
+
+        self.smoothed_raw = np.array([], dtype=np.float64)
         self.smoothed_dc = np.array([], dtype=np.float64)
         self.dc_prev_x = np.complex64(0.0 + 0.0j)
         self.dc_prev_y = np.complex64(0.0 + 0.0j)
-        self.prev_peak_hz = 0.0
+        self.prev_peak_hz: float | None = None
         self.monitor_axis_khz = np.linspace(
             -config.CENTERED_SPAN_HZ / 1000.0,
             config.CENTERED_SPAN_HZ / 1000.0,
             int(config.RX_MONITOR_SPECTRUM_BINS),
             dtype=np.float64,
         )
+        self.monitor_raw_row = np.full_like(self.monitor_axis_khz, -140.0)
         self.monitor_centered_row = np.full_like(self.monitor_axis_khz, -140.0)
         self.monitor_noise_floor_dbfs = -140.0
         self.monitor_sideband_snr_db = 0.0
@@ -75,14 +92,11 @@ class ReceiverLoopRxOnly:
         self.cfo_total_hz = 0.0
         self.cfo_phase_rad = 0.0
 
-        self.ncc_abs_ema = 0.0
         self.ncc_lock = False
-        self.ncc_enter_count = 0
-        self.ncc_exit_count = 0
+        self._lock_enter_count = 0
+        self._lock_exit_count = 0
         self.last_decode_summary = "No live decode yet"
         self.last_logic_tail = ""
-
-        self.total_bits = 0
 
         self.frame_index = 0
         self.last_frame_start_s: float | None = None
@@ -92,7 +106,6 @@ class ReceiverLoopRxOnly:
         self.rx_time_ema_s = 0.0
         self.process_time_ema_s = 0.0
         self.frame_gap_ema_s = 0.0
-        self.max_process_s = 0.0
         self.late_frame_count = 0
         self.gap_slip_count = 0
 
@@ -109,6 +122,11 @@ class ReceiverLoopRxOnly:
         self.decoded_packets = 0
         self.decode_status_hold = 0
         self.last_reject_signature = ""
+        self.last_displayed_auth_counter: int | None = None
+
+    @property
+    def _dc_bin_guard_hz(self) -> float:
+        return float(config.SAMPLE_RATE) / float(config.RX_BUFFER_SIZE)
 
     def close(self) -> None:
         try:
@@ -116,35 +134,51 @@ class ReceiverLoopRxOnly:
         except Exception:
             pass
 
-    def _update_lock_hysteresis(self, abs_ncc: float) -> None:
-        self.ncc_abs_ema = (
-            (1.0 - config.NCC_DISPLAY_ALPHA) * self.ncc_abs_ema
-            + config.NCC_DISPLAY_ALPHA * abs_ncc
+    def _update_lock_hysteresis(self) -> None:
+        """Pure SNR-driven lock hysteresis.
+
+        Enter requires SNR_LOCK_THRESHOLD_DB sustained for LOCK_ENTER_FRAMES;
+        exit requires SNR below threshold - SNR_LOCK_EXIT_MARGIN_DB sustained
+        for LOCK_EXIT_FRAMES.
+        """
+        snr = float(self.monitor_sideband_snr_db)
+        snr_enter_ok = snr >= float(config.SNR_LOCK_THRESHOLD_DB)
+        snr_exit_ok = snr < (
+            float(config.SNR_LOCK_THRESHOLD_DB) - float(config.SNR_LOCK_EXIT_MARGIN_DB)
         )
         if not self.ncc_lock:
-            self.ncc_enter_count = (
-                self.ncc_enter_count + 1 if self.ncc_abs_ema >= config.NCC_ENTER_THRESHOLD else 0
-            )
-            if self.ncc_enter_count >= config.NCC_ENTER_FRAMES:
-                self.ncc_lock, self.ncc_exit_count = True, 0
+            self._lock_enter_count = self._lock_enter_count + 1 if snr_enter_ok else 0
+            if self._lock_enter_count >= int(config.LOCK_ENTER_FRAMES):
+                self.ncc_lock = True
+                self._lock_exit_count = 0
         else:
-            self.ncc_exit_count = (
-                self.ncc_exit_count + 1 if self.ncc_abs_ema <= config.NCC_EXIT_THRESHOLD else 0
-            )
-            if self.ncc_exit_count >= config.NCC_EXIT_FRAMES:
-                self.ncc_lock, self.ncc_enter_count = False, 0
+            self._lock_exit_count = self._lock_exit_count + 1 if snr_exit_ok else 0
+            if self._lock_exit_count >= int(config.LOCK_EXIT_FRAMES):
+                self.ncc_lock = False
+                self._lock_enter_count = 0
 
     def _slice_chips_for_phase(self, state: PhaseState, peak_hz: float) -> int:
         added = 0
+        # Rebuild the carrier-to-DC mix only when the tracked peak moves
+        # by more than one FFT bin; otherwise reuse the cached complex64
+        # vector across all chips and phases in this frame.
+        peak_bin_hz = float(config.SAMPLE_RATE) / float(config.RX_BUFFER_SIZE)
+        if (
+            self._chip_mix_c64 is None
+            or self._chip_mix_peak_hz is None
+            or abs(float(peak_hz) - float(self._chip_mix_peak_hz)) > peak_bin_hz
+        ):
+            n_chip = np.arange(self.bit_samples, dtype=np.float64)
+            self._chip_mix_c64 = np.exp(
+                -1j * 2.0 * np.pi * float(peak_hz) * n_chip / float(config.SAMPLE_RATE)
+            ).astype(np.complex64)
+            self._chip_mix_peak_hz = float(peak_hz)
+        mix_c64 = self._chip_mix_c64
+        ref_f1 = self._ref_f1_c64
+        ref_f0 = self._ref_f0_c64
         while state.next_sample + self.bit_samples <= len(self.phase_sample_buffer):
             chunk = self.phase_sample_buffer[state.next_sample : state.next_sample + self.bit_samples]
-            m_f1, m_f0, decision = coherent_fsk_metrics(
-                chunk,
-                peak_hz,
-                config.FSK_F1_HZ,
-                config.FSK_F0_HZ,
-                config.SAMPLE_RATE,
-            )
+            m_f1, m_f0, decision = coherent_fsk_metrics_cached(chunk, mix_c64, ref_f1, ref_f0)
             both_below_floor = max(m_f1, m_f0) < config.FSK_PRESENCE_FLOOR
             in_dead_zone = abs(decision) < config.FSK_DECISION_DEAD_ZONE
             if both_below_floor or in_dead_zone:
@@ -178,16 +212,12 @@ class ReceiverLoopRxOnly:
 
     def _update_live_decode_summary(self) -> None:
         chips_by_phase = {phase: state.chips for phase, state in self.phase_state.items()}
-        base_chip_index_by_phase = {
-            phase: state.base_chip_index for phase, state in self.phase_state.items()
-        }
         analysis = analyze_live_decode(
             chips_by_phase,
             tail_bits=48,
             include_matches=False,
             secure_rx=self.secure_rx,
             verified_cache=self._packet_cache,
-            base_chip_index_by_phase=base_chip_index_by_phase,
         )
 
         is_auth = "AUTHENTICATED" in analysis.best_text
@@ -247,20 +277,64 @@ class ReceiverLoopRxOnly:
             for _ in range(drop):
                 self._packet_cache.pop(next(iter(self._packet_cache)))
 
-    def _emit_status(self, peak_hz: float) -> None:
+    def _emit_status(self, peak_hz: float | None) -> None:
         if self.frame_index % max(1, int(config.RX_TERMINAL_STATUS_EVERY_FRAMES)) != 0:
             return
         best_phase = max(self.phase_offsets, key=lambda p: self.phase_state[p].chips_seen)
+        peak_label = 0.0 if peak_hz is None else float(peak_hz)
+
+        # Suppress repeat status lines for an AUTHENTICATED packet whose
+        # counter has already been displayed since acceptance. The first time
+        # each new counter actually prints, we let it through and remember it;
+        # subsequent prints with the same counter are quieted to "No live
+        # decode yet". Tracking happens at print time (not at live-decode
+        # update time) so the first display is never lost when live decode
+        # fires multiple times between status frames.
+        decode_text = self.last_decode_summary
+        if (
+            bool(config.AUTHENTICATED_STATUS_SUPPRESS_REPEATS)
+            and "AUTHENTICATED" in decode_text
+            and "counter=" in decode_text
+        ):
+            shown_counter: int | None
+            try:
+                shown_counter = int(
+                    decode_text.split("counter=", 1)[1].split(" ", 1)[0]
+                )
+            except (ValueError, IndexError):
+                shown_counter = None
+            if shown_counter is not None:
+                if shown_counter == self.last_displayed_auth_counter:
+                    decode_text = "No live decode yet"
+                else:
+                    self.last_displayed_auth_counter = shown_counter
+
         print(
             f"[RX STATUS] frame={self.frame_index} lock={'1' if self.ncc_lock else '0'} "
-            f"phase={best_phase} peak={peak_hz:+.1f}Hz cfo={self.cfo_total_hz:+.1f}Hz "
-            f"snr={self.monitor_sideband_snr_db:+.1f}dB bits={self.last_logic_tail or '-'} "
-            f"decode={self.last_decode_summary}",
+            f"phase={best_phase} peak={peak_label:+.1f}Hz cfo={self.cfo_total_hz:+.1f}Hz "
+            f"snr={self.monitor_sideband_snr_db:+.1f}dB "
+            f"proc={1000.0*self.process_time_ema_s:.1f}ms "
+            f"late={self.late_frame_count} slip={self.gap_slip_count} "
+            f"bits={self.last_logic_tail or '-'} "
+            f"decode={decode_text}",
             flush=True,
         )
 
-    def _update_monitor_spectrum(self, freqs_hz: np.ndarray, peak_hz: float) -> None:
-        if peak_hz == 0.0 or self.smoothed_dc.size == 0:
+    def _update_monitor_spectrum(self, freqs_hz: np.ndarray, peak_hz: float | None) -> None:
+        if self.smoothed_raw.size:
+            raw_mask = np.abs(freqs_hz) <= config.CENTERED_SPAN_HZ
+            if np.any(raw_mask):
+                raw_freqs_khz = freqs_hz[raw_mask] / 1000.0
+                raw_spec = smooth_1d(self.smoothed_raw[raw_mask], config.CENTERED_FREQ_SMOOTH_BINS)
+                self.monitor_raw_row = np.interp(
+                    self.monitor_axis_khz,
+                    raw_freqs_khz,
+                    raw_spec,
+                    left=-140.0,
+                    right=-140.0,
+                ).astype(np.float64, copy=False)
+
+        if peak_hz is None or self.smoothed_dc.size == 0:
             return
 
         centered_freqs_hz = freqs_hz - peak_hz
@@ -290,35 +364,30 @@ class ReceiverLoopRxOnly:
         self.monitor_sideband_pos_dbfs = float(sb_pos)
         self.monitor_sideband_neg_dbfs = float(sb_neg)
 
-    def _write_status_snapshot(self, peak_hz: float) -> None:
+    def _write_status_snapshot(self, peak_hz: float | None) -> None:
         if self.frame_index % max(1, int(config.RX_STATUS_EVERY_FRAMES)) != 0:
             return
         best_phase = max(self.phase_offsets, key=lambda p: self.phase_state[p].chips_seen)
         st = self.phase_state[best_phase]
+        peak_value = 0.0 if peak_hz is None else float(peak_hz)
         payload = {
             "frame": self.frame_index,
             "lock": 1 if self.ncc_lock else 0,
-            "ncc_ema": round(self.ncc_abs_ema, 4),
             "cfo_hz": round(self.cfo_total_hz, 3),
-            "coarse_hz": round(self.cfo_coarse_hz, 3),
-            "fine_hz": round(self.cfo_fine_hz, 3),
-            "peak_hz": round(float(peak_hz), 3),
+            "peak_hz": round(peak_value, 3),
             "best_phase": int(best_phase),
             "chips_seen": int(st.chips_seen),
-            "chip_tail": bits_to_text(st.chips[-48:]),
             "rx_ms": round(1000.0 * self.rx_time_ema_s, 3),
             "proc_ms": round(1000.0 * self.process_time_ema_s, 3),
             "gap_ms": round(1000.0 * self.frame_gap_ema_s, 3),
-            "budget_ms": round(1000.0 * self.realtime_budget_s, 3),
             "late_frames": int(self.late_frame_count),
             "gap_slips": int(self.gap_slip_count),
+            "monitor_raw_row_dbfs": [round(float(v), 2) for v in self.monitor_raw_row],
             "monitor_row_dbfs": [round(float(v), 2) for v in self.monitor_centered_row],
             "monitor_noise_floor_dbfs": round(float(self.monitor_noise_floor_dbfs), 2),
             "monitor_sideband_snr_db": round(float(self.monitor_sideband_snr_db), 2),
             "monitor_sideband_pos_dbfs": round(float(self.monitor_sideband_pos_dbfs), 2),
             "monitor_sideband_neg_dbfs": round(float(self.monitor_sideband_neg_dbfs), 2),
-            "logic_tail": self.last_logic_tail,
-            "decode_summary": self.last_decode_summary,
         }
         payload_text = json.dumps(payload, separators=(",", ":"))
         tmp_path = self.status_path.with_suffix(self.status_path.suffix + ".tmp")
@@ -353,11 +422,18 @@ class ReceiverLoopRxOnly:
 
         peak_hz = self.prev_peak_hz
         need_peak_update = (
-            peak_hz == 0.0
+            peak_hz is None
             or self.frame_index % max(1, int(config.RX_ONLY_PEAK_TRACK_EVERY_FRAMES)) == 0
         )
         if need_peak_update:
-            freqs_hz, dc_dbfs_full = compute_spectrum_dbfs(x_dc, config.SAMPLE_RATE)
+            _, raw_dbfs_full = compute_spectrum_dbfs(x_raw, config.SAMPLE_RATE)
+            self.smoothed_raw = ema_spectrum_power_domain(raw_dbfs_full, self.smoothed_raw, config.FFT_AVG_ALPHA)
+
+            search_samples = x_dc
+            if peak_hz is None and config.EXCITER_SEARCH_MIN_HZ <= 0.0:
+                search_samples = x_raw
+
+            freqs_hz, dc_dbfs_full = compute_spectrum_dbfs(search_samples, config.SAMPLE_RATE)
             self.smoothed_dc = ema_spectrum_power_domain(dc_dbfs_full, self.smoothed_dc, config.FFT_AVG_ALPHA)
             in_view = np.abs(freqs_hz) <= config.SPECTRUM_SPAN_HZ
             peak_hz, _ = find_exciter_peak(
@@ -367,34 +443,63 @@ class ReceiverLoopRxOnly:
                 self.prev_peak_hz,
                 config.EXCITER_SEARCH_MIN_HZ,
                 config.EXCITER_SEARCH_MAX_HZ,
+                expected_hz=float(config.EXCITER_EXPECTED_HZ),
+                expected_tol_hz=float(config.EXCITER_EXPECTED_TOL_HZ),
+                strict_expected_band=bool(config.EXCITER_STRICT_EXPECTED_BAND),
+                max_step_hz=float(config.EXCITER_MAX_STEP_HZ),
+                switch_margin_db=float(config.EXCITER_SWITCH_MARGIN_DB),
             )
             self.prev_peak_hz = peak_hz
             self._update_monitor_spectrum(freqs_hz, peak_hz)
 
-        if peak_hz != 0.0:
-            demod = bandpass_filter_around_carrier(
-                x_dc, peak_hz, config.SAMPLE_RATE, config.DEMOD_FILTER_PASSBAND_HZ
-            )
+        if peak_hz is not None:
+            demod_input = x_dc
+            if abs(float(peak_hz)) <= self._dc_bin_guard_hz:
+                demod_input = x_raw
+
+            demod = demod_input
 
             if config.CFO_CORRECTION_ENABLED and demod.size:
-                n = np.arange(demod.size, dtype=np.float64)
-                mix = np.exp(-1j * 2.0 * np.pi * float(peak_hz) * n / float(config.SAMPLE_RATE))
-                demod_bb = demod.astype(np.complex128) * mix
+                # CFO estimation is expensive at full buffer size. Decimate by
+                # CFO_DECIMATE for the residual estimate (Kay's estimator stays
+                # accurate for any oversampled tone), then derotate the full
+                # buffer with the smoothed CFO.
+                cfo_decim = max(1, int(getattr(config, "CFO_DECIMATE", 8)))
+                demod_for_cfo = demod[::cfo_decim]
+                n = np.arange(demod_for_cfo.size, dtype=np.float64)
+                mix = np.exp(
+                    -1j * 2.0 * np.pi * float(peak_hz) * (n * cfo_decim)
+                    / float(config.SAMPLE_RATE)
+                )
+                demod_bb = demod_for_cfo.astype(np.complex128) * mix
 
-                residual_hat_hz = estimate_residual_cfo_hz(demod_bb.astype(np.complex64), config.SAMPLE_RATE)
+                # Gate CFO estimate on carrier SNR: the carrier at DC must dominate
+                # before the phase-advance estimator is trustworthy.  At low SNR the
+                # estimator returns noise-dominated values and corrupts the EMA.
+                dc_power = abs(complex(np.mean(demod_bb))) ** 2
+                total_power = float(np.mean(np.abs(demod_bb) ** 2))
+                residual_power = max(total_power - dc_power, 1e-30)
+                snr_db = 10.0 * np.log10(dc_power / residual_power) if dc_power > 0 else -999.0
+
                 max_abs = float(config.CFO_MAX_ABS_HZ)
-                residual_hat_hz = float(np.clip(residual_hat_hz, -max_abs, max_abs))
+                if float(snr_db) >= float(config.CFO_SNR_GATE_DB):
+                    residual_hat_hz = estimate_residual_cfo_hz(
+                        demod_bb.astype(np.complex64),
+                        float(config.SAMPLE_RATE) / float(cfo_decim),
+                    )
+                    residual_hat_hz = float(np.clip(residual_hat_hz, -max_abs, max_abs))
 
-                self.cfo_coarse_hz = (
-                    (1.0 - config.CFO_COARSE_ALPHA) * self.cfo_coarse_hz
-                    + config.CFO_COARSE_ALPHA * residual_hat_hz
-                )
-                residual_part_hz = residual_hat_hz - self.cfo_coarse_hz
-                self.cfo_fine_hz = (
-                    (1.0 - config.CFO_FINE_ALPHA) * self.cfo_fine_hz
-                    + config.CFO_FINE_ALPHA * residual_part_hz
-                )
-                self.cfo_total_hz = float(np.clip(self.cfo_coarse_hz + self.cfo_fine_hz, -max_abs, max_abs))
+                    self.cfo_coarse_hz = (
+                        (1.0 - config.CFO_COARSE_ALPHA) * self.cfo_coarse_hz
+                        + config.CFO_COARSE_ALPHA * residual_hat_hz
+                    )
+                    residual_part_hz = residual_hat_hz - self.cfo_coarse_hz
+                    self.cfo_fine_hz = (
+                        (1.0 - config.CFO_FINE_ALPHA) * self.cfo_fine_hz
+                        + config.CFO_FINE_ALPHA * residual_part_hz
+                    )
+                    self.cfo_total_hz = float(np.clip(self.cfo_coarse_hz + self.cfo_fine_hz, -max_abs, max_abs))
+                # else: SNR too low — freeze EMA, do not corrupt with noise
 
                 demod, self.cfo_phase_rad = derotate_frequency(
                     demod,
@@ -408,10 +513,10 @@ class ReceiverLoopRxOnly:
                 self.cfo_total_hz = 0.0
                 self.cfo_phase_rad = 0.0
 
-            m_f1_buf, m_f0_buf, _ = coherent_fsk_metrics(
-                demod, peak_hz, config.FSK_F1_HZ, config.FSK_F0_HZ, config.SAMPLE_RATE
-            )
-            self._update_lock_hysteresis(max(m_f1_buf, m_f0_buf))
+            # Lock hysteresis is driven by the sideband SNR computed during
+            # peak-update frames; running coherent_fsk_metrics over the full
+            # buffer here was a duplicate ~30 ms/frame of work.
+            self._update_lock_hysteresis()
 
             self.phase_sample_buffer = np.concatenate((self.phase_sample_buffer, demod))
             chips_added = 0
@@ -422,8 +527,10 @@ class ReceiverLoopRxOnly:
                     self._capture_phase_update(phase, state, phase_added)
 
             if chips_added > 0:
-                self.total_bits += chips_added
-                self._update_live_decode_summary()
+                # Throttle the heavy packet search; chips remain in history.
+                decode_cadence = max(1, int(getattr(config, "LIVE_DECODE_EVERY_FRAMES", 1)))
+                if self.frame_index % decode_cadence == 0:
+                    self._update_live_decode_summary()
 
                 min_next = min(s.next_sample for s in self.phase_state.values())
                 if min_next > self.bit_samples:
@@ -443,7 +550,6 @@ class ReceiverLoopRxOnly:
                 ((1.0 - alpha) * self.frame_gap_ema_s) + (alpha * frame_gap_s)
             )
 
-        self.max_process_s = max(self.max_process_s, process_elapsed_s)
         late_budget_s = self.realtime_budget_s * float(config.JITTER_LATE_FACTOR)
         gap_budget_s = self.realtime_budget_s * float(config.JITTER_GAP_FACTOR)
         if process_elapsed_s > late_budget_s:
