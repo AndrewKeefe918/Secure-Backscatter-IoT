@@ -49,11 +49,11 @@ SPECTRUM_SPAN_HZ = 150000.0
 FFT_AVG_ALPHA = 0.1
 # Reject DC/LO leakage; only track carriers comfortably away from DC.
 EXCITER_SEARCH_MIN_HZ = 5000.0
-EXCITER_SEARCH_MAX_HZ = 40000.0
+EXCITER_SEARCH_MAX_HZ = 50000.0
 # Expected exciter offset (matches exciter/pluto_exciter.py TONE_HZ); restricts
 # lock to this neighborhood to avoid DC sidebands / interferers winning.
 EXCITER_EXPECTED_HZ = 15625.0
-EXCITER_EXPECTED_TOL_HZ = 0.0
+EXCITER_EXPECTED_TOL_HZ = 30000.0
 EXCITER_STRICT_EXPECTED_BAND = True
 # Anti-jump hysteresis: prevent large peak hops unless meaningfully stronger.
 EXCITER_MAX_STEP_HZ = 300.0
