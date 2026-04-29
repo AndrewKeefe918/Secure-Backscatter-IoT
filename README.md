@@ -48,9 +48,14 @@ python -m receiver.demo_attacks
 
 ## Hardware setup
 
-| Door open (tag transmitting) | Door shut (tag silent) |
-|:---:|:---:|
-| ![Door open setup](documents/pictures/Door_open_setup.jpeg) | ![Door shut setup](documents/pictures/Door_shut_Setup.jpeg) |
+<p align="center">
+  <img src="documents/pictures/Door_open_setup.jpeg" alt="Door open setup" width="45%" />
+  &nbsp;&nbsp;
+  <img src="documents/pictures/Door_shut_Setup.jpeg" alt="Door shut setup" width="45%" />
+</p>
+<p align="center">
+  <em>Left: door open (tag transmitting) &nbsp;&nbsp; Right: door shut (tag silent)</em>
+</p>
 
 ## Exciter runtime and functions
 
