@@ -113,9 +113,8 @@ Tag is actively transmitting. SNR climbs above the lock threshold, FSK
 sidebands are visible at ±1 kHz and ±1.7 kHz in the carrier-centered view,
 and the receiver authenticates each packet.
 
-| RX Monitor | Terminal |
-|:---:|:---:|
-| ![RX monitor — door open](documents/pictures/Door_open_rx_monitor.PNG) | ![Terminal — door open](documents/pictures/Door_open_terminal.PNG) |
+<p align="center"><img src="documents/pictures/Door_open_rx_monitor.PNG" alt="RX monitor — door open" width="90%" /></p>
+<p align="center"><img src="documents/pictures/Door_open_terminal.PNG" alt="Terminal — door open" width="90%" /></p>
 
 ### Tag silent — door shut
 
@@ -123,9 +122,8 @@ Reed switch grounded: tag stops modulating. SNR drops below the lock
 threshold and no sideband bumps appear. The receiver shows the last
 authenticated packet in a held state.
 
-| RX Monitor | Terminal |
-|:---:|:---:|
-| ![RX monitor — door shut](documents/pictures/Door_shut_rx_monitor.PNG) | ![Terminal — door shut](documents/pictures/Door_shut_terminal.PNG) |
+<p align="center"><img src="documents/pictures/Door_shut_rx_monitor.PNG" alt="RX monitor — door shut" width="90%" /></p>
+<p align="center"><img src="documents/pictures/Door_shut_terminal.PNG" alt="Terminal — door shut" width="90%" /></p>
 
 ### Single transmission — open then shut
 
@@ -133,9 +131,8 @@ SNR profile in the signal-quality panel ramps up as the tag begins
 transmitting, the receiver locks and decodes one authenticated packet,
 then SNR returns to baseline when the reed switch closes.
 
-| RX Monitor | Terminal |
-|:---:|:---:|
-| ![RX monitor — single transmission](documents/pictures/Single_transmission_rx_monitor_open_shut.PNG) | ![Terminal — single transmission](documents/pictures/Single_transmission_terminal.PNG) |
+<p align="center"><img src="documents/pictures/Single_transmission_rx_monitor_open_shut.PNG" alt="RX monitor — single transmission" width="90%" /></p>
+<p align="center"><img src="documents/pictures/Single_transmission_terminal.PNG" alt="Terminal — single transmission" width="90%" /></p>
 
 ## FSK vs. OOK Design Rationale
 
