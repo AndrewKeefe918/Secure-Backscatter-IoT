@@ -41,8 +41,8 @@ python -m receiver.demo_attacks
 ## Video demo
 
 <p align="center">
-  <a href="https://youtu.be/rRYwHWMTVfA">
-    <img src="https://img.youtube.com/vi/rRYwHWMTVfA/hqdefault.jpg" alt="Watch the RX + RX monitor demo" />
+  <a href="https://youtu.be/y_z2ynHgnjk">
+    <img src="https://img.youtube.com/vi/y_z2ynHgnjk/hqdefault.jpg" alt="Watch the RX + RX monitor demo" />
   </a>
 </p>
 
