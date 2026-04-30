@@ -48,6 +48,25 @@ python -m receiver.demo_attacks
 
 ## Hardware setup
 
+The end-to-end link uses three independent radios:
+
+- **Exciter** — PlutoSDR on a Raspberry Pi, transmitting CW at
+  $f_{LO} + f_{TONE} = 2.48\text{ GHz} + 15{,}625$ Hz. Configured in
+  [exciter/pluto_exciter.py](exciter/pluto_exciter.py); started
+  automatically on boot via the systemd unit in
+  [exciter/pluto_exciter_service.txt](exciter/pluto_exciter_service.txt).
+- **Tag** — MSP430G2553 (EXP-G2ET LaunchPad) running
+  [BackscatterTag/Msp_FSK_secure.c](BackscatterTag/Msp_FSK_secure.c).
+  Timer_A0 drives the backscatter load FET at 1.0 kHz ('1' bits) or
+  1.7 kHz ('0' bits). A reed switch on `P1.3` (active-low, internal
+  pull-up) gates transmission: open ⇒ transmit `OPEN`, shut ⇒ silent.
+- **Receiver** — PlutoSDR on the PC, tuned to the same
+  $f_{LO} = 2.48$ GHz, running the
+  [receiver/](receiver/) DSP + crypto stack.
+
+The two photos below show the same physical setup with the magnet
+actuator in the two reed-switch states:
+
 <p align="center">
   <img src="documents/pictures/Door_open_setup.jpeg" alt="Door open setup" width="45%" />
   &nbsp;&nbsp;
@@ -133,6 +152,51 @@ then SNR returns to baseline when the reed switch closes.
 
 <p align="center"><img src="documents/pictures/Single_transmission_rx_monitor_open_shut.PNG" alt="RX monitor — single transmission" width="90%" /></p>
 <p align="center"><img src="documents/pictures/Single_transmission_terminal.PNG" alt="Terminal — single transmission" width="90%" /></p>
+
+## Attack demo (offline crypto verification)
+
+`receiver/demo_attacks.py` exercises the live security path in
+`receiver/secure_packet.py` without needing the SDR or the tag. It builds
+packets in software using the same construction as
+`BackscatterTag/Msp_FSK_secure.c` (AES-CTR + AES-CMAC[0:8] + monotonic
+counter) and feeds them through the same `SecureReceiver` used at runtime,
+so the verdicts shown below are exactly what the live receiver would
+produce on air.
+
+<p align="center"><img src="documents/pictures/attack_demo_output.png" alt="Attack demo terminal output" width="80%" /></p>
+
+What each scenario shows:
+
+- **Scenario 1 — Legitimate packet.** A fresh packet at `counter=100` is
+  accepted. This is the baseline: valid CMAC, monotonic counter, plaintext
+  decrypts to `OPEN`.
+- **Scenario 2 — Replay attack.** The exact bytes from Scenario 1 are
+  re-emitted. The CMAC still verifies (the adversary didn't change
+  anything), but the receiver rejects on `counter <= last_accepted`. An
+  older capture at `counter=50` is also rejected for the same reason.
+  This is the protection that bare `AA 7E O P E N` over OOK would not
+  have.
+- **Scenario 3 — Tampering.** A single bit is flipped in the ciphertext of
+  a fresh-counter packet. CMAC verification fails, so the packet is
+  rejected before any decryption result is trusted. Any in-flight bit
+  error or active modification produces this outcome.
+- **Scenario 4 — Forgery.** The adversary builds a packet with the wrong
+  key (all zeros) at `counter=300`, and also tries 16 random bytes. Both
+  fail CMAC verification. Without the shared key, the attacker can't
+  produce a tag that the receiver will accept, regardless of how
+  plausible the counter or ciphertext look.
+- **Scenario 5 — Recovery.** A legitimate packet at `counter=500` is still
+  accepted after the attacks. Replay/tamper/forgery attempts don't poison
+  the receiver state; the monotonic counter just advances past anything
+  the attacker tried.
+
+The summary line at the bottom captures the security claim: only the two
+genuine packets are accepted; every replay, tamper, and forgery attempt is
+rejected. The closing reminder — *"Without auth + replay protection, the
+on-air bytes 'AA 7E O P E N' are publicly observable, so scenarios 2–4
+would all OPEN THE DOOR"* — is why the link uses authenticated encryption
+plus a monotonic counter rather than just transmitting the plaintext
+command.
 
 ## FSK vs. OOK Design Rationale
 
@@ -252,10 +316,15 @@ derotates the remaining residual before chip slicing.
 **Peak-search configuration impact.** Because the nominal tone is
 +15 625 Hz and worst-case relative LO mismatch is about $\pm 24.8$ kHz,
 the peak can appear up to about $+40.4$ kHz. The receiver therefore uses
-`EXCITER_SEARCH_MIN_HZ = 5000`, `EXCITER_SEARCH_MAX_HZ = 50000`, and a
-strict expected band with `EXCITER_EXPECTED_TOL_HZ = 30000` in
-[receiver/config.py](receiver/config.py) to preserve margin while still
-rejecting distant interferers.
+`EXCITER_SEARCH_MIN_HZ = 5000` to reject DC/LO leakage and a strict
+expected band with `EXCITER_EXPECTED_TOL_HZ = 30000` and
+`EXCITER_STRICT_EXPECTED_BAND = True` in
+[receiver/config.py](receiver/config.py). The strict band is the binding
+constraint on lock acquisition: it confines the peak finder to
+$f_{TONE} \pm 30$ kHz, comfortably covering the worst-case $+40.4$ kHz
+drift while rejecting unrelated interferers. `EXCITER_SEARCH_MAX_HZ =
+5\times 10^6` is set well above Nyquist ($f_s/2 = 500$ kHz) so it never
+clips the search before the strict-band gate does.
 
 ### 2. Tag subcarrier from MSP430 Timer_A0
 

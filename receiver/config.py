@@ -10,7 +10,7 @@ RX_URI = "ip:192.168.2.1"
 FREQ_HZ = 2.48e9
 SAMPLE_RATE = 1e6
 RX_GAIN_MODE: str = "manual"
-RX_GAIN_DB = 40.0
+RX_GAIN_DB = 45.0
 # Per-buffer realtime budget = RX_BUFFER_SIZE / SAMPLE_RATE.
 #   65536 @ 1 MS/s -> 65.5 ms (recommended)
 #  131072 @ 1 MS/s -> 131 ms  (4x headroom, ~2x FFT/frame)
@@ -48,8 +48,8 @@ LIVE_DECODE_MAX_PAYLOAD_BYTES = 24
 SPECTRUM_SPAN_HZ = 150000.0
 FFT_AVG_ALPHA = 0.1
 # Reject DC/LO leakage; only track carriers comfortably away from DC.
-EXCITER_SEARCH_MIN_HZ = 5000.0
-EXCITER_SEARCH_MAX_HZ = 50000.0
+EXCITER_SEARCH_MIN_HZ = 5e3
+EXCITER_SEARCH_MAX_HZ = 5e6
 # Expected exciter offset (matches exciter/pluto_exciter.py TONE_HZ); restricts
 # lock to this neighborhood to avoid DC sidebands / interferers winning.
 EXCITER_EXPECTED_HZ = 15625.0
@@ -134,6 +134,10 @@ PHASE_HISTORY_BITS = 256
 # Phase hypotheses spread uniformly across one bit period; live decoder picks
 # the best. 4 phases -> ±12.5% max misalignment, reliable at SNR > 6 dB.
 PHASE_COUNT = 4
+# Hysteresis for best-phase tracking: a challenger must exceed the current
+# winner's frame-quality by this fractional margin before the selection switches.
+# Frame-quality is accumulated per-frame per-phase; switches happen once per frame.
+PHASE_SWITCH_MARGIN = 0.50
 
 # ---- Runtime jitter telemetry -----------------------------------------------
 # Late frame: total processing exceeds this share of buffer time.

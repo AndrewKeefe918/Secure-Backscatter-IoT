@@ -46,7 +46,7 @@ FREQ_HZ = 2.48e9
 SAMPLE_RATE = int(1e6)   # 1 MHz — must match receiver SAMPLE_RATE in receiver/config.py
 
 # --- TX power ---
-TX_GAIN_DB = -5.0         # step up from -15 for stronger backscatter
+TX_GAIN_DB = -15.0         # step up from -15 for stronger backscatter
 
 # Raw IQ amplitude in DAC counts (int16 scale: 2^14 = 16384).
 # The adi library passes these directly to libiio without normalisation.
