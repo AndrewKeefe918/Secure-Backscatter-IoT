@@ -31,6 +31,34 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.cmac import CMAC
 
 
+# ---- Bit / byte helpers -----------------------------------------------------
+# Used by the live decode path (live_decode.py, rx_monitor.py, receiver_loop.py)
+# to turn header/payload bytes into MSB-first bit lists and back.
+
+def bytes_to_bit_list(data: bytes) -> list[int]:
+    bits: list[int] = []
+    for byte in data:
+        for shift in range(7, -1, -1):
+            bits.append((byte >> shift) & 1)
+    return bits
+
+
+def bits_to_bytes(bits: list[int]) -> bytes:
+    if len(bits) % 8 != 0:
+        return b""
+    out = bytearray()
+    for i in range(0, len(bits), 8):
+        value = 0
+        for bit in bits[i : i + 8]:
+            value = (value << 1) | int(bit)
+        out.append(value)
+    return bytes(out)
+
+
+def bits_to_text(bits: list[int]) -> str:
+    return "".join("1" if b else "0" for b in bits)
+
+
 # ---- Constants (must match firmware) ----------------------------------------
 
 KEY_LEN = 16

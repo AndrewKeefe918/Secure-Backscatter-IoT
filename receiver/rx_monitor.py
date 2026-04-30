@@ -18,7 +18,7 @@ from matplotlib.animation import FuncAnimation
 
 from . import config as config
 from .live_decode import analyze_live_decode
-from .packet_decoder import (
+from .secure_packet import (
     bits_to_bytes,
     bytes_to_bit_list,
 )

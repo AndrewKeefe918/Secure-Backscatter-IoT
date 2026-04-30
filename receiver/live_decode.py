@@ -5,13 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import config as config
-from .packet_decoder import (
+from .secure_packet import (
+    DecodedPacket,
+    SecureReceiver,
     bits_to_bytes,
     bytes_to_bit_list,
-    majority_decode_triplets,
 )
-from .secure_packet import SecureReceiver
-from .secure_packet import DecodedPacket
 
 # Module-level SecureReceiver for the live-decode path (no persistent state —
 # the RX-only loop holds the authoritative replay state).
@@ -84,7 +83,9 @@ def analyze_live_decode(
             continue
 
         for decode_offset in range(config.REPETITION_CHIPS):
-            decoded_bits = majority_decode_triplets(chips, decode_offset)
+            # REPETITION_CHIPS == 1: each chip is one bit. The slice keeps
+            # the function shape if rep-coding is ever reintroduced.
+            decoded_bits = chips[decode_offset:]
             if decoded_bits and not best_tail_bits:
                 best_tail_bits = decoded_bits[-tail_bits:]
             if len(decoded_bits) < min_packet_bits:

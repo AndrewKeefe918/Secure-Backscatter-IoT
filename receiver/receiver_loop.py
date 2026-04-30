@@ -28,7 +28,7 @@ from .dsp import (
     smooth_1d,
 )
 from .live_decode import analyze_live_decode
-from .packet_decoder import bits_to_text
+from .secure_packet import bits_to_text
 from .secure_packet import DecodedPacket
 from .secure_packet import SecureReceiver
 
