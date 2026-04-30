@@ -310,7 +310,7 @@ $f_{TONE} \pm f_1$ and $f_{TONE} \pm f_0$ in
 [receiver/dsp.py](receiver/dsp.py) `compute_sideband_snr`:
 
 $$
-\text{SNR}_{dB} = \max\!\big(P_{+f_{sub}}, P_{-f_{sub}}\big) - P_{noise}
+\text{SNR}_{dB} = \max\big(P_{+f_{sub}}, P_{-f_{sub}}\big) - P_{noise}
 $$
 
 ### 5. Coherent FSK chip metric
@@ -350,7 +350,7 @@ and removed by a phase-continuous derotator:
 
 $$
 \hat{f}_{CFO} = \frac{f_s}{2\pi}\;
-\arg\!\left(\frac{1}{N-1}\sum_{n=1}^{N-1} x[n]\,x^{\ast}[n-1]\right)
+\arg\left(\frac{1}{N-1}\sum_{n=1}^{N-1} x[n]\,x^{\ast}[n-1]\right)
 $$
 
 A two-pole EMA (`CFO_COARSE_ALPHA`, `CFO_FINE_ALPHA`) smooths this
@@ -385,14 +385,14 @@ $$
 Ciphertext over plaintext "OPEN" (4 bytes):
 
 $$
-C = P \oplus \mathrm{AES}_{K}\!\big(\text{IV}\big)\big[0{:}4\big]
+C = P \oplus \mathrm{AES}_{K}\big(\text{IV}\big)\big[0{:}4\big]
 $$
 
 Authentication tag (NIST SP 800-38B / RFC 4493 AES-CMAC, truncated to
 the leading 8 bytes):
 
 $$
-T = \mathrm{CMAC}_{K}\!\big(\text{CTR} \,\Vert\, C\big)\big[0{:}8\big]
+T = \mathrm{CMAC}_{K}\big(\text{CTR} \,\Vert\, C\big)\big[0{:}8\big]
 $$
 
 Receiver acceptance rule (in
@@ -466,15 +466,15 @@ per frame, so the waterfall image looks denser without changing the
 transported payload or the receiver's per-frame DSP cost.
 
 Display bin count and bin width on the carrier-centered axis (span
-$\pm\,$`CENTERED_SPAN_HZ` $= \pm 8$ kHz):
+$\pm$ `CENTERED_SPAN_HZ` $= \pm 8$ kHz):
 
 $$
 N_{disp} = M\,N_{tx},\qquad
-\Delta f_{disp} = \frac{2\,\text{CENTERED\_SPAN\_HZ}}{N_{disp} - 1}
+\Delta f_{disp} = \frac{2 \cdot 8000}{N_{disp} - 1}
 $$
 
-With `WATERFALL_DISPLAY_OVERSAMPLE = M = 4`,
-`RX_MONITOR_SPECTRUM_BINS = N_{tx} = 192`:
+With `WATERFALL_DISPLAY_OVERSAMPLE` $= M = 4$,
+`RX_MONITOR_SPECTRUM_BINS` $= N_{tx} = 192$:
 
 $$
 N_{disp} = 4 \cdot 192 = 768,\qquad
